@@ -1,0 +1,30 @@
+[
+  {
+    "pt_path": "/path/to/exp_finetune/pretrained.pt",
+    "keyword": "小美小美",
+    "score": 1.0,
+    "threshold": 0.35,
+    "bpe_model": "data/lang_bpe_500/bpe.model",
+    "model_args": {
+      "causal": 1,
+      "chunk_size": "16",
+      "left_context_frames": "64",
+      "decoder_dim": 320,
+      "joiner_dim": 320,
+      "num_encoder_layers": "1,1,1,1,1,1",
+      "feedforward_dim": "192,192,192,192,192,192",
+      "encoder_dim": "128,128,128,128,128,128",
+      "encoder_unmasked_dim": "128,128,128,128,128,128",
+      "downsampling_factor": "1,2,4,8,4,2",
+      "num_heads": "4,4,4,8,4,4",
+      "cnn_module_kernel": "31,31,15,15,15,31",
+      "query_head_dim": "32",
+      "value_head_dim": "12",
+      "pos_head_dim": "4",
+      "pos_dim": 48,
+      "context_size": 2,
+      "use_transducer": 1,
+      "use_ctc": 0
+    }
+  }
+]

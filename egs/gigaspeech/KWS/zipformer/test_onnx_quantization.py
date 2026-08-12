@@ -20,9 +20,13 @@ generate_calibration_bundle = quantization.generate_calibration_bundle
 load_calibration_manifest = quantization.load_calibration_manifest
 load_model_io_schema = quantization.load_model_io_schema
 model_artifact_hash = quantization.model_artifact_hash
+normalize_static_quantization_op_types = (
+    quantization.normalize_static_quantization_op_types
+)
 quantize_static_int8 = quantization.quantize_static_int8
 quantize_weight_only_int8 = quantization.quantize_weight_only_int8
 resolve_quantization_mode = quantization.resolve_quantization_mode
+resolve_static_quantization_op_types = quantization.resolve_static_quantization_op_types
 validate_calibration_manifest = quantization.validate_calibration_manifest
 validate_quantized_model_artifact = quantization.validate_quantized_model_artifact
 _load_feature_array = quantization._load_feature_array
@@ -42,6 +46,52 @@ _load_feature_array = quantization._load_feature_array
 )
 def test_resolve_quantization_mode(mode, legacy, expected) -> None:
     assert resolve_quantization_mode(mode, legacy) == expected
+
+
+@pytest.mark.parametrize(
+    "profile,component,expected",
+    [
+        ("legacy", "encoder", ("MatMul", "Conv")),
+        ("balanced", "encoder", ("MatMul", "Gemm", "Conv")),
+        ("balanced", "decoder", ("Gather", "MatMul", "Gemm", "Conv")),
+        ("balanced", "joiner", ("MatMul", "Gemm")),
+    ],
+)
+def test_static_quantization_profiles(profile, component, expected) -> None:
+    assert resolve_static_quantization_op_types(component, profile) == expected
+
+
+def test_static_quantization_extended_profile_and_override() -> None:
+    extended = resolve_static_quantization_op_types("encoder", "extended")
+    assert extended[:3] == ("MatMul", "Gemm", "Conv")
+    assert {
+        "Transpose",
+        "Reshape",
+        "Squeeze",
+        "Unsqueeze",
+        "Flatten",
+        "Slice",
+        "Split",
+        "Add",
+        "Mul",
+    }.issubset(extended)
+    assert "Gather" in resolve_static_quantization_op_types("decoder", "extended")
+    assert normalize_static_quantization_op_types(" MatMul, Gather,MatMul ") == (
+        "MatMul",
+        "Gather",
+    )
+    assert resolve_static_quantization_op_types(
+        "decoder", "legacy", "Gather,MatMul"
+    ) == ("Gather", "MatMul")
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        normalize_static_quantization_op_types("")
+    with pytest.raises(ValueError, match="Invalid ONNX op type"):
+        normalize_static_quantization_op_types("MatMul,com.microsoft::Foo")
+    with pytest.raises(ValueError, match="component"):
+        resolve_static_quantization_op_types("frontend", "balanced")
+    with pytest.raises(ValueError, match="profile"):
+        resolve_static_quantization_op_types("encoder", "aggressive")
 
 
 def _make_weight_model(
@@ -559,6 +609,9 @@ def test_static_qdq_quantization(
     )
 
     assert report["sample_count"] == 3
+    assert report["op_types_to_quantize"] == ["MatMul", "Conv"]
+    assert report["matmul_const_b_only"] is False
+    assert report["preprocess"] is False
     assert load_model_io_schema(output_filename) == load_model_io_schema(model_filename)
     model = onnx.load(str(output_filename))
     assert any(node.op_type == "QuantizeLinear" for node in model.graph.node)
@@ -585,6 +638,9 @@ def test_static_qdq_quantization(
     metadata = {item.key: item.value for item in model.metadata_props}
     assert metadata["test_metadata"] == "preserved"
     assert metadata["icefall.quantization.mode"] == "static_int8"
+    assert metadata["icefall.quantization.op_types"] == "MatMul,Conv"
+    assert metadata["icefall.quantization.matmul_const_b_only"] == "0"
+    assert metadata["icefall.quantization.preprocess"] == "0"
     assert metadata["icefall.quantization.calibration_bundle_sha256"] == "a" * 64
     assert "icefall.quantization.calibration_manifest_sha256" not in metadata
     if external_data:
@@ -612,6 +668,83 @@ def test_static_qdq_quantization(
     )
     assert set(stats) == {"matmul_out", "conv_out", "ids_out"}
     assert stats["ids_out"]["max_abs"] == 0
+
+
+@pytest.mark.parametrize("external_data", [False, True])
+def test_static_qdq_configurable_preprocess_and_matmul_policy(
+    tmp_path: Path, monkeypatch, external_data: bool
+) -> None:
+    model_filename = tmp_path / "model.onnx"
+    output_filename = tmp_path / "model.configured.static-int8.onnx"
+    sample_dir = tmp_path / "samples"
+    sample_dir.mkdir()
+    _make_weight_model(
+        model_filename,
+        external_data=external_data,
+        large=external_data,
+    )
+    np.savez(sample_dir / "000000.npz", **_calibration_inputs())
+
+    calls = {}
+    original_preprocess = quantization.quant_pre_process
+    original_quantize_static = quantization.quantize_static
+
+    def record_preprocess(*args, **kwargs):
+        calls["preprocess_args"] = args
+        calls["preprocess_kwargs"] = kwargs
+        return original_preprocess(*args, **kwargs)
+
+    def record_quantize_static(*args, **kwargs):
+        calls["quantize_kwargs"] = kwargs
+        return original_quantize_static(*args, **kwargs)
+
+    monkeypatch.setattr(quantization, "quant_pre_process", record_preprocess)
+    monkeypatch.setattr(quantization, "quantize_static", record_quantize_static)
+
+    report = quantize_static_int8(
+        model_input=model_filename,
+        model_output=output_filename,
+        sample_dir=sample_dir,
+        calibration_method="minmax",
+        use_external_data=external_data,
+        op_types_to_quantize="MatMul,Conv,MatMul",
+        matmul_const_b_only=True,
+        preprocess=True,
+        preprocess_skip_symbolic_shape=True,
+    )
+
+    preprocess_input = Path(calls["preprocess_args"][0])
+    if external_data:
+        assert preprocess_input.name == "materialized-input.onnx"
+    else:
+        assert preprocess_input == model_filename
+    assert calls["preprocess_kwargs"]["skip_optimization"] is False
+    assert calls["preprocess_kwargs"]["skip_onnx_shape"] is False
+    assert calls["preprocess_kwargs"]["skip_symbolic_shape"] is True
+    assert calls["preprocess_kwargs"]["save_as_external_data"] is external_data
+    quantize_kwargs = calls["quantize_kwargs"]
+    assert Path(quantize_kwargs["model_input"]).name == "preprocessed.onnx"
+    assert quantize_kwargs["op_types_to_quantize"] == ["MatMul", "Conv"]
+    assert quantize_kwargs["extra_options"]["MatMulConstBOnly"] is True
+    assert report["op_types_to_quantize"] == ["MatMul", "Conv"]
+    assert report["matmul_const_b_only"] is True
+    assert report["preprocess"] is True
+
+    metadata = {
+        item.key: item.value for item in onnx.load(str(output_filename)).metadata_props
+    }
+    output_model = onnx.load(str(output_filename), load_external_data=False)
+    assert all(item.domain in ("", "ai.onnx") for item in output_model.opset_import)
+    assert (
+        any(
+            initializer.data_location == TensorProto.EXTERNAL
+            for initializer in output_model.graph.initializer
+        )
+        is external_data
+    )
+    assert metadata["icefall.quantization.matmul_const_b_only"] == "1"
+    assert metadata["icefall.quantization.preprocess"] == "1"
+    assert metadata["icefall.quantization.preprocess_skip_symbolic_shape"] == "1"
 
 
 def _save_streaming_models(
@@ -841,6 +974,9 @@ def test_generate_streaming_calibration_bundle(
                 bundle_dir / component,
                 calibration_method="minmax",
                 calibration_bundle_hash_value=bundle_hash,
+                op_types_to_quantize=resolve_static_quantization_op_types(
+                    component, "extended"
+                ),
             )
             metadata = {
                 item.key: item.value
@@ -850,7 +986,20 @@ def test_generate_streaming_calibration_bundle(
                 metadata["icefall.quantization.calibration_bundle_sha256"]
                 == bundle_hash
             )
+            assert metadata["icefall.quantization.op_types"] == ",".join(
+                resolve_static_quantization_op_types(component, "extended")
+            )
             static_filenames[component] = output_filename
+        joiner_model = onnx.load(str(static_filenames["joiner"]))
+        producers = {
+            output: node for node in joiner_model.graph.node for output in node.output
+        }
+        joiner_add = next(
+            node for node in joiner_model.graph.node if node.op_type == "Add"
+        )
+        assert all(
+            producers[name].op_type == "DequantizeLinear" for name in joiner_add.input
+        )
         static_comparison = compare_streaming_model_sets(
             model_filenames,
             static_filenames,

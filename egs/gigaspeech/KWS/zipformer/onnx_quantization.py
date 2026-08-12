@@ -20,10 +20,95 @@ from onnxruntime.quantization import (
     QuantType,
     quantize_static,
 )
+from onnxruntime.quantization.shape_inference import quant_pre_process
 
 PathLike = Union[str, Path]
 STANDARD_ONNX_DOMAINS = {"", "ai.onnx"}
 CALIBRATION_COMPONENTS = ("encoder", "decoder", "joiner")
+STATIC_QDQ_PASSTHROUGH_OP_TYPES = (
+    "Transpose",
+    "Reshape",
+    "Squeeze",
+    "Unsqueeze",
+    "Flatten",
+    "Slice",
+    "Split",
+)
+STATIC_QDQ_RESIDUAL_OP_TYPES = ("Add", "Mul")
+STATIC_QUANTIZATION_PROFILES = {
+    "legacy": {
+        "encoder": ("MatMul", "Conv"),
+        "decoder": ("MatMul", "Conv"),
+        "joiner": ("MatMul", "Conv"),
+    },
+    "balanced": {
+        "encoder": ("MatMul", "Gemm", "Conv"),
+        "decoder": ("Gather", "MatMul", "Gemm", "Conv"),
+        "joiner": ("MatMul", "Gemm"),
+    },
+    "extended": {
+        "encoder": (
+            "MatMul",
+            "Gemm",
+            "Conv",
+            *STATIC_QDQ_PASSTHROUGH_OP_TYPES,
+            *STATIC_QDQ_RESIDUAL_OP_TYPES,
+        ),
+        "decoder": (
+            "Gather",
+            "MatMul",
+            "Gemm",
+            "Conv",
+            *STATIC_QDQ_PASSTHROUGH_OP_TYPES,
+            *STATIC_QDQ_RESIDUAL_OP_TYPES,
+        ),
+        "joiner": (
+            "MatMul",
+            "Gemm",
+            *STATIC_QDQ_PASSTHROUGH_OP_TYPES,
+            *STATIC_QDQ_RESIDUAL_OP_TYPES,
+        ),
+    },
+}
+
+
+def normalize_static_quantization_op_types(
+    op_types: Union[str, Sequence[str]],
+) -> Tuple[str, ...]:
+    if isinstance(op_types, str):
+        values = op_types.split(",")
+    else:
+        values = list(op_types)
+    normalized = []
+    seen = set()
+    for value in values:
+        op_type = value.strip()
+        if not op_type:
+            raise ValueError("Static quantization op types must not be empty")
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", op_type) is None:
+            raise ValueError(f"Invalid ONNX op type: {op_type}")
+        if op_type not in seen:
+            normalized.append(op_type)
+            seen.add(op_type)
+    if not normalized:
+        # ORT treats an empty list as "all supported ops", which is too broad
+        # for a component-specific static quantization policy.
+        raise ValueError("Static quantization requires at least one op type")
+    return tuple(normalized)
+
+
+def resolve_static_quantization_op_types(
+    component: str,
+    profile: str = "legacy",
+    override: Optional[Union[str, Sequence[str]]] = None,
+) -> Tuple[str, ...]:
+    if component not in CALIBRATION_COMPONENTS:
+        raise ValueError(f"Unsupported static quantization component: {component}")
+    if profile not in STATIC_QUANTIZATION_PROFILES:
+        raise ValueError(f"Unsupported static quantization profile: {profile}")
+    if override is not None:
+        return normalize_static_quantization_op_types(override)
+    return STATIC_QUANTIZATION_PROFILES[profile][component]
 
 
 def resolve_quantization_mode(
@@ -144,6 +229,27 @@ def _save_model(
     onnx.checker.check_model(str(filename))
 
 
+def _materialize_external_data_for_preprocess(
+    model_input: Path,
+    temporary_directory: Path,
+) -> Path:
+    model_without_data = onnx.load(str(model_input), load_external_data=False)
+    if not _external_locations(model_without_data):
+        return model_input
+
+    materialized_filename = temporary_directory / "materialized-input.onnx"
+    try:
+        model = onnx.load(str(model_input), load_external_data=True)
+        onnx.save_model(model, str(materialized_filename))
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ValueError(
+            "Unable to materialize external ONNX data for quantization "
+            "preprocessing; disable preprocessing for models that exceed the "
+            "2 GiB protobuf limit"
+        ) from error
+    return materialized_filename
+
+
 def _model_metadata_values(model: onnx.ModelProto) -> Dict[str, str]:
     return {item.key: item.value for item in model.metadata_props}
 
@@ -175,6 +281,20 @@ def _custom_node_fingerprints(
                         )
                     )
     return fingerprints
+
+
+def _custom_node_domains(graph: onnx.GraphProto) -> Set[str]:
+    domains = set()
+    for node in graph.node:
+        if node.domain not in STANDARD_ONNX_DOMAINS:
+            domains.add(node.domain)
+        for attribute in node.attribute:
+            if attribute.type == onnx.AttributeProto.GRAPH:
+                domains.update(_custom_node_domains(attribute.g))
+            elif attribute.type == onnx.AttributeProto.GRAPHS:
+                for subgraph in attribute.graphs:
+                    domains.update(_custom_node_domains(subgraph))
+    return domains
 
 
 def _custom_domain_fingerprint(model: onnx.ModelProto) -> Dict[str, object]:
@@ -1167,9 +1287,31 @@ def generate_calibration_bundle(
 def _update_model_metadata_file(
     filename: PathLike,
     metadata: Dict[str, object],
+    source_filename: PathLike,
 ) -> None:
     filename = Path(filename)
     model = onnx.load(str(filename), load_external_data=False)
+    source = onnx.load(str(source_filename), load_external_data=False)
+    source_custom_domains = {
+        item.domain
+        for item in source.opset_import
+        if item.domain not in STANDARD_ONNX_DOMAINS
+    }
+    used_custom_domains = _custom_node_domains(model.graph)
+    kept_opsets = [
+        (item.domain, item.version)
+        for item in model.opset_import
+        if item.domain in STANDARD_ONNX_DOMAINS
+        or item.domain in source_custom_domains
+        or item.domain in used_custom_domains
+    ]
+    if len(kept_opsets) != len(model.opset_import):
+        # ORT graph optimization may append every registered custom domain even
+        # when the graph does not use it. Keep the artifact reproducible without
+        # hiding newly introduced custom nodes from validation.
+        del model.opset_import[:]
+        for domain, version in kept_opsets:
+            model.opset_import.append(helper.make_opsetid(domain, version))
     set_model_metadata(model, metadata)
     onnx.save_model(model, str(filename))
     onnx.checker.check_model(str(filename))
@@ -1183,6 +1325,12 @@ def quantize_static_int8(
     use_external_data: bool = False,
     calibration_manifest_hash: Optional[str] = None,
     calibration_bundle_hash_value: Optional[str] = None,
+    op_types_to_quantize: Optional[Union[str, Sequence[str]]] = None,
+    matmul_const_b_only: bool = False,
+    preprocess: bool = False,
+    preprocess_skip_optimization: bool = False,
+    preprocess_skip_onnx_shape: bool = False,
+    preprocess_skip_symbolic_shape: bool = False,
 ) -> Dict[str, object]:
     if calibration_method == "percentile":
         method = CalibrationMethod.Percentile
@@ -1199,25 +1347,59 @@ def quantize_static_int8(
     bundle_hash = calibration_bundle_hash_value or calibration_manifest_hash
     model_input = Path(model_input)
     model_output = Path(model_output)
+    if op_types_to_quantize is None:
+        op_types = STATIC_QUANTIZATION_PROFILES["legacy"]["encoder"]
+    else:
+        op_types = normalize_static_quantization_op_types(op_types_to_quantize)
     original_schema = load_model_io_schema(model_input)
     reader = NpzCalibrationDataReader(model_input, sample_dir)
-    quantize_static(
-        model_input=model_input,
-        model_output=model_output,
-        calibration_data_reader=reader,
-        quant_format=QuantFormat.QDQ,
-        op_types_to_quantize=["MatMul", "Conv"],
-        per_channel=True,
-        reduce_range=False,
-        activation_type=QuantType.QInt8,
-        weight_type=QuantType.QInt8,
-        use_external_data_format=use_external_data,
-        calibrate_method=method,
-        extra_options={
-            "QDQOpTypePerChannelSupportToAxis": {"MatMul": 1},
-            "WeightSymmetric": True,
-        },
-    )
+    temporary_directory = None
+    quantization_input = model_input
+    try:
+        if preprocess:
+            temporary_directory = tempfile.TemporaryDirectory(
+                prefix="icefall-onnx-quant-preprocess-"
+            )
+            temporary_path = Path(temporary_directory.name)
+            preprocess_input = _materialize_external_data_for_preprocess(
+                model_input,
+                temporary_path,
+            )
+            quantization_input = temporary_path / "preprocessed.onnx"
+            quant_pre_process(
+                str(preprocess_input),
+                str(quantization_input),
+                skip_optimization=preprocess_skip_optimization,
+                skip_onnx_shape=preprocess_skip_onnx_shape,
+                skip_symbolic_shape=preprocess_skip_symbolic_shape,
+                save_as_external_data=use_external_data,
+                all_tensors_to_one_file=use_external_data,
+                external_data_location=(
+                    "preprocessed.weights" if use_external_data else None
+                ),
+                external_data_size_threshold=0,
+            )
+        quantize_static(
+            model_input=quantization_input,
+            model_output=model_output,
+            calibration_data_reader=reader,
+            quant_format=QuantFormat.QDQ,
+            op_types_to_quantize=list(op_types),
+            per_channel=True,
+            reduce_range=False,
+            activation_type=QuantType.QInt8,
+            weight_type=QuantType.QInt8,
+            use_external_data_format=use_external_data,
+            calibrate_method=method,
+            extra_options={
+                "QDQOpTypePerChannelSupportToAxis": {"MatMul": 1},
+                "WeightSymmetric": True,
+                "MatMulConstBOnly": matmul_const_b_only,
+            },
+        )
+    finally:
+        if temporary_directory is not None:
+            temporary_directory.cleanup()
     if load_model_io_schema(model_output) != original_schema:
         raise ValueError("Static quantization changed the model I/O schema")
     metadata = {
@@ -1228,13 +1410,24 @@ def quantize_static_int8(
         "icefall.quantization.per_channel": "1",
         "icefall.quantization.reduce_range": "0",
         "icefall.quantization.matmul_axis": "1",
-        "icefall.quantization.op_types": "MatMul,Conv",
+        "icefall.quantization.op_types": ",".join(op_types),
+        "icefall.quantization.matmul_const_b_only": int(matmul_const_b_only),
+        "icefall.quantization.preprocess": int(preprocess),
+        "icefall.quantization.preprocess_skip_optimization": int(
+            preprocess_skip_optimization
+        ),
+        "icefall.quantization.preprocess_skip_onnx_shape": int(
+            preprocess_skip_onnx_shape
+        ),
+        "icefall.quantization.preprocess_skip_symbolic_shape": int(
+            preprocess_skip_symbolic_shape
+        ),
         "icefall.quantization.calibration_method": calibration_method,
         "icefall.quantization.onnxruntime_version": ort.__version__,
     }
     if bundle_hash is not None:
         metadata["icefall.quantization.calibration_bundle_sha256"] = bundle_hash
-    _update_model_metadata_file(model_output, metadata)
+    _update_model_metadata_file(model_output, metadata, model_input)
     validate_quantized_model_artifact(model_input, model_output, metadata)
     return {
         "model_input": str(model_input),
@@ -1242,6 +1435,9 @@ def quantize_static_int8(
         "calibration_method": calibration_method,
         "sample_count": len(reader.files),
         "io_schema": original_schema,
+        "op_types_to_quantize": list(op_types),
+        "matmul_const_b_only": bool(matmul_const_b_only),
+        "preprocess": bool(preprocess),
     }
 
 

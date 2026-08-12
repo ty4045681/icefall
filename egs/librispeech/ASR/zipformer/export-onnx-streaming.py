@@ -75,6 +75,12 @@ Each file must contain only a float32 array named "features" with shape
 with the exact source ONNX models, features, limits, and calibration method
 recorded in its manifest.
 
+The static path preserves the legacy MatMul/Conv policy by default. Use
+--static-quantization-profile balanced for component-specific operator sets,
+or extended to also quantize eligible layout and residual operators. Graph
+preprocessing, MatMulConstBOnly, and per-component operator overrides are
+available as independent switches.
+
 Calibration and closed-loop comparisons use deterministic max-symbol-per-frame
 1 greedy decoding to sample activations and measure numerical drift. They do
 not reproduce context-graph KWS beam search; final keyword metrics must be
@@ -94,6 +100,7 @@ import torch
 import torch.nn as nn
 from decoder import Decoder
 from onnx_quantization import (
+    STATIC_QUANTIZATION_PROFILES,
     calibration_bundle_hash,
     compare_models_on_npz,
     compare_streaming_model_sets,
@@ -101,6 +108,7 @@ from onnx_quantization import (
     quantize_static_int8,
     quantize_weight_only_int8,
     resolve_quantization_mode,
+    resolve_static_quantization_op_types,
     validate_calibration_manifest,
 )
 from onnxruntime.quantization import QuantType, quantize_dynamic
@@ -114,8 +122,7 @@ from icefall.checkpoint import (
     find_checkpoints,
     load_checkpoint,
 )
-from icefall.utils import num_tokens, str2bool
-from icefall.utils import get_onnx_export_kwargs
+from icefall.utils import get_onnx_export_kwargs, num_tokens, str2bool
 
 
 def get_parser():
@@ -183,6 +190,64 @@ def get_parser():
         choices=["percentile", "minmax"],
         default="percentile",
         help="Calibration range method for static QDQ quantization.",
+    )
+
+    parser.add_argument(
+        "--static-quantization-profile",
+        choices=sorted(STATIC_QUANTIZATION_PROFILES),
+        default="legacy",
+        help="Component-specific static QDQ operator policy. 'legacy' keeps "
+        "the previous MatMul/Conv behavior; 'extended' also targets eligible "
+        "layout and residual operators.",
+    )
+
+    for component in ("encoder", "decoder", "joiner"):
+        parser.add_argument(
+            f"--static-{component}-op-types",
+            type=str,
+            help=f"Comma-separated ONNX op types overriding the static "
+            f"profile for {component}.",
+        )
+
+    parser.add_argument(
+        "--static-matmul-const-b-only",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="1 to quantize MatMul only when its second input is constant.",
+    )
+
+    parser.add_argument(
+        "--static-preprocess",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="1 to run ORT symbolic/ONNX shape inference and basic graph "
+        "optimization before static quantization.",
+    )
+
+    parser.add_argument(
+        "--static-preprocess-skip-optimization",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="1 to skip graph optimization during quantization preprocessing.",
+    )
+
+    parser.add_argument(
+        "--static-preprocess-skip-onnx-shape",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="1 to skip ONNX shape inference during preprocessing.",
+    )
+
+    parser.add_argument(
+        "--static-preprocess-skip-symbolic-shape",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="1 to skip ORT symbolic shape inference during preprocessing.",
     )
 
     parser.add_argument(
@@ -1103,7 +1168,20 @@ def main():
             "decoder": decoder_filename_static,
             "joiner": joiner_filename_static,
         }
+        static_op_type_overrides = {
+            "encoder": params.static_encoder_op_types,
+            "decoder": params.static_decoder_op_types,
+            "joiner": params.static_joiner_op_types,
+        }
         for component, output_filename in static_filenames.items():
+            op_types = resolve_static_quantization_op_types(
+                component=component,
+                profile=params.static_quantization_profile,
+                override=static_op_type_overrides[component],
+            )
+            logging.info(
+                f"Static quantization {component} op types: {','.join(op_types)}"
+            )
             quantize_static_int8(
                 model_input=model_filenames[component],
                 model_output=output_filename,
@@ -1113,6 +1191,18 @@ def main():
                     params.use_external_data if component == "encoder" else False
                 ),
                 calibration_bundle_hash_value=manifest_hash,
+                op_types_to_quantize=op_types,
+                matmul_const_b_only=bool(params.static_matmul_const_b_only),
+                preprocess=bool(params.static_preprocess),
+                preprocess_skip_optimization=bool(
+                    params.static_preprocess_skip_optimization
+                ),
+                preprocess_skip_onnx_shape=bool(
+                    params.static_preprocess_skip_onnx_shape
+                ),
+                preprocess_skip_symbolic_shape=bool(
+                    params.static_preprocess_skip_symbolic_shape
+                ),
             )
 
         candidate_model_sets = {"static": static_filenames}

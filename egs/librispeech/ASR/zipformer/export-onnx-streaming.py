@@ -61,19 +61,48 @@ It will generate the following 3 files inside $repo/exp:
   - decoder-epoch-99-avg-1-chunk-16-left-128.onnx
   - joiner-epoch-99-avg-1-chunk-16-left-128.onnx
 
+Quantization modes:
+
+  - dynamic: Preserves the legacy .int8.onnx dynamic quantization output.
+  - weight-only: Stores MatMul/Conv weights as per-channel QInt8 while
+    keeping activations and model I/O types unchanged.
+  - static: Generates S8S8 QDQ models calibrated for ARM CPU inference.
+  - all: Generates all three quantized variants.
+
+Static quantization accepts a directory containing one NPZ file per utterance.
+Each file must contain only a float32 array named "features" with shape
+(num_frames, feature_dim). The generated calibration bundle is reusable only
+with the exact source ONNX models, features, limits, and calibration method
+recorded in its manifest.
+
+Calibration and closed-loop comparisons use deterministic max-symbol-per-frame
+1 greedy decoding to sample activations and measure numerical drift. They do
+not reproduce context-graph KWS beam search; final keyword metrics must be
+measured with the deployment KWS evaluation path.
+
 See ./onnx_pretrained-streaming.py for how to use the exported ONNX models.
 """
 
 import argparse
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import k2
 import onnx
 import torch
 import torch.nn as nn
 from decoder import Decoder
+from onnx_quantization import (
+    calibration_bundle_hash,
+    compare_models_on_npz,
+    compare_streaming_model_sets,
+    generate_calibration_bundle,
+    quantize_static_int8,
+    quantize_weight_only_int8,
+    resolve_quantization_mode,
+    validate_calibration_manifest,
+)
 from onnxruntime.quantization import QuantType, quantize_dynamic
 from scaling_converter import convert_scaled_to_non_scaled
 from train import add_model_arguments, get_model, get_params
@@ -105,7 +134,55 @@ def get_parser():
         "--enable-int8-quantization",
         type=int,
         default=1,
-        help="1 to also export int8 onnx models.",
+        help="1 to also export the legacy dynamically quantized int8 models.",
+    )
+
+    parser.add_argument(
+        "--quantization-mode",
+        choices=["none", "dynamic", "weight-only", "static", "all"],
+        default=None,
+        help="Quantization outputs to generate. When omitted, the legacy "
+        "--enable-int8-quantization behavior is preserved.",
+    )
+
+    parser.add_argument(
+        "--calibration-feature-dir",
+        type=Path,
+        help="Directory of utterance NPZ files containing float32 features.",
+    )
+
+    parser.add_argument(
+        "--calibration-data-dir",
+        type=Path,
+        help="Directory to create or reuse for static calibration samples.",
+    )
+
+    parser.add_argument(
+        "--calibration-max-utterances",
+        type=int,
+        default=100,
+        help="Maximum number of feature NPZ utterances used for calibration.",
+    )
+
+    parser.add_argument(
+        "--calibration-max-chunks",
+        type=int,
+        default=1000,
+        help="Maximum number of streaming encoder chunks used for calibration.",
+    )
+
+    parser.add_argument(
+        "--calibration-max-samples-per-model",
+        type=int,
+        default=1000,
+        help="Maximum number of NPZ reader samples generated per ONNX component.",
+    )
+
+    parser.add_argument(
+        "--static-calibration-method",
+        choices=["percentile", "minmax"],
+        default="percentile",
+        help="Calibration range method for static QDQ quantization.",
     )
 
     parser.add_argument(
@@ -412,7 +489,7 @@ class OnnxJoiner(nn.Module):
 def export_encoder_model_onnx(
     encoder_model: OnnxEncoder,
     encoder_filename: str,
-    opset_version: int = 11,
+    opset_version: int = 13,
     feature_dim: int = 80,
     dynamic_batch: bool = True,
     use_whisper_features: bool = False,
@@ -583,9 +660,10 @@ def export_encoder_model_onnx(
 def export_decoder_model_onnx(
     decoder_model: OnnxDecoder,
     decoder_filename: str,
-    opset_version: int = 11,
+    opset_version: int = 13,
     dynamic_batch: bool = True,
     use_int32_inputs: int = 0,
+    unk_id: Optional[int] = None,
 ) -> None:
     """Export the decoder model to ONNX format.
 
@@ -607,6 +685,7 @@ def export_decoder_model_onnx(
     """
     context_size = decoder_model.decoder.context_size
     vocab_size = decoder_model.decoder.vocab_size
+    blank_id = decoder_model.decoder.blank_id
 
     if use_int32_inputs:
         y = torch.zeros(1, context_size, dtype=torch.int32)
@@ -634,6 +713,8 @@ def export_decoder_model_onnx(
     meta_data = {
         "context_size": str(context_size),
         "vocab_size": str(vocab_size),
+        "blank_id": str(blank_id),
+        "unk_id": str(blank_id if unk_id is None else unk_id),
     }
     add_meta_data(filename=decoder_filename, meta_data=meta_data)
 
@@ -641,7 +722,7 @@ def export_decoder_model_onnx(
 def export_joiner_model_onnx(
     joiner_model: nn.Module,
     joiner_filename: str,
-    opset_version: int = 11,
+    opset_version: int = 13,
     dynamic_batch: bool = True,
 ) -> None:
     """Export the joiner model to ONNX format.
@@ -655,6 +736,7 @@ def export_joiner_model_onnx(
         - logit: a tensor of shape (N, vocab_size)
     """
     joiner_dim = joiner_model.output_linear.weight.shape[1]
+    vocab_size = joiner_model.output_linear.weight.shape[0]
     logging.info(f"joiner dim: {joiner_dim}")
 
     projected_encoder_out = torch.rand(1, joiner_dim, dtype=torch.float32)
@@ -682,6 +764,7 @@ def export_joiner_model_onnx(
 )
     meta_data = {
         "joiner_dim": str(joiner_dim),
+        "vocab_size": str(vocab_size),
     }
     add_meta_data(filename=joiner_filename, meta_data=meta_data)
 
@@ -702,6 +785,12 @@ def main():
 
     token_table = k2.SymbolTable.from_file(params.tokens)
     params.blank_id = token_table["<blk>"]
+    try:
+        params.unk_id = token_table["<unk>"]
+    except KeyError:
+        params.unk_id = params.blank_id
+    if params.unk_id is None or params.unk_id < 0:
+        params.unk_id = params.blank_id
     params.vocab_size = num_tokens(token_table) + 1
 
     logging.info(params)
@@ -857,6 +946,7 @@ def main():
         opset_version=opset_version,
         dynamic_batch=params.dynamic_batch == 1,
         use_int32_inputs=params.use_int32_inputs,
+        unk_id=params.unk_id,
     )
     logging.info(f"Exported decoder to {decoder_filename}")
 
@@ -869,6 +959,10 @@ def main():
         dynamic_batch=params.dynamic_batch == 1,
     )
     logging.info(f"Exported joiner to {joiner_filename}")
+
+    encoder_filename = Path(encoder_filename).resolve()
+    decoder_filename = Path(decoder_filename).resolve()
+    joiner_filename = Path(joiner_filename).resolve()
 
     if params.fp16:
         logging.info("Generate fp16 models")
@@ -889,8 +983,13 @@ def main():
     # Generate int8 quantization models
     # See https://onnxruntime.ai/docs/performance/model-optimizations/quantization.html#data-type-selection
 
-    if params.enable_int8_quantization:
-        logging.info("Generate int8 quantization models")
+    quantization_mode = resolve_quantization_mode(
+        params.quantization_mode, params.enable_int8_quantization
+    )
+    logging.info(f"quantization mode: {quantization_mode}")
+
+    if quantization_mode in ("dynamic", "all"):
+        logging.info("Generate dynamically quantized int8 models")
 
         if params.use_external_data:
             encoder_filename_int8 = f"encoder-{suffix}.int8.onnx"
@@ -919,6 +1018,138 @@ def main():
             op_types_to_quantize=["MatMul"],
             weight_type=QuantType.QInt8,
         )
+
+    if quantization_mode in ("weight-only", "all"):
+        logging.info("Generate weight-only int8 models")
+
+        if params.use_external_data:
+            encoder_filename_weight_only = f"encoder-{suffix}.weight-only-int8.onnx"
+        else:
+            encoder_filename_weight_only = (
+                params.exp_dir / f"encoder-{suffix}.weight-only-int8.onnx"
+            )
+        quantize_weight_only_int8(
+            model_input=encoder_filename,
+            model_output=encoder_filename_weight_only,
+            use_external_data=params.use_external_data,
+        )
+
+        decoder_filename_weight_only = (
+            params.exp_dir / f"decoder-{suffix}.weight-only-int8.onnx"
+        )
+        quantize_weight_only_int8(
+            model_input=decoder_filename,
+            model_output=decoder_filename_weight_only,
+        )
+
+        joiner_filename_weight_only = (
+            params.exp_dir / f"joiner-{suffix}.weight-only-int8.onnx"
+        )
+        quantize_weight_only_int8(
+            model_input=joiner_filename,
+            model_output=joiner_filename_weight_only,
+        )
+
+    if quantization_mode in ("static", "all"):
+        logging.info("Generate statically quantized int8 models")
+        model_filenames = {
+            "encoder": encoder_filename,
+            "decoder": decoder_filename,
+            "joiner": joiner_filename,
+        }
+        calibration_data_dir = params.calibration_data_dir
+        if calibration_data_dir is None:
+            calibration_data_dir = params.exp_dir / f"calibration-{suffix}"
+        if calibration_data_dir.exists():
+            manifest = validate_calibration_manifest(
+                calibration_data_dir,
+                model_filenames,
+                params.static_calibration_method,
+                feature_dir=params.calibration_feature_dir,
+                max_utterances=params.calibration_max_utterances,
+                max_chunks=params.calibration_max_chunks,
+                max_samples_per_model=params.calibration_max_samples_per_model,
+            )
+            logging.info(f"Reuse calibration bundle: {calibration_data_dir}")
+        else:
+            if params.calibration_feature_dir is None:
+                raise ValueError(
+                    "Static quantization requires --calibration-feature-dir when "
+                    "the calibration bundle does not exist"
+                )
+            manifest = generate_calibration_bundle(
+                model_filenames=model_filenames,
+                feature_dir=params.calibration_feature_dir,
+                bundle_dir=calibration_data_dir,
+                calibration_method=params.static_calibration_method,
+                max_utterances=params.calibration_max_utterances,
+                max_chunks=params.calibration_max_chunks,
+                max_samples_per_model=params.calibration_max_samples_per_model,
+            )
+            logging.info(f"Generated calibration bundle: {calibration_data_dir}")
+        logging.info(f"calibration sample counts: {manifest['sample_counts']}")
+        manifest_hash = calibration_bundle_hash(calibration_data_dir)
+
+        if params.use_external_data:
+            encoder_filename_static = f"encoder-{suffix}.static-int8.onnx"
+        else:
+            encoder_filename_static = (
+                params.exp_dir / f"encoder-{suffix}.static-int8.onnx"
+            )
+        decoder_filename_static = params.exp_dir / f"decoder-{suffix}.static-int8.onnx"
+        joiner_filename_static = params.exp_dir / f"joiner-{suffix}.static-int8.onnx"
+        static_filenames = {
+            "encoder": encoder_filename_static,
+            "decoder": decoder_filename_static,
+            "joiner": joiner_filename_static,
+        }
+        for component, output_filename in static_filenames.items():
+            quantize_static_int8(
+                model_input=model_filenames[component],
+                model_output=output_filename,
+                sample_dir=calibration_data_dir / component,
+                calibration_method=params.static_calibration_method,
+                use_external_data=(
+                    params.use_external_data if component == "encoder" else False
+                ),
+                calibration_bundle_hash_value=manifest_hash,
+            )
+
+        candidate_model_sets = {"static": static_filenames}
+        if quantization_mode == "all":
+            candidate_model_sets.update(
+                {
+                    "dynamic": {
+                        "encoder": encoder_filename_int8,
+                        "decoder": decoder_filename_int8,
+                        "joiner": joiner_filename_int8,
+                    },
+                    "weight-only": {
+                        "encoder": encoder_filename_weight_only,
+                        "decoder": decoder_filename_weight_only,
+                        "joiner": joiner_filename_weight_only,
+                    },
+                }
+            )
+
+        for candidate_name, candidate_filenames in candidate_model_sets.items():
+            for component, output_filename in candidate_filenames.items():
+                stats = compare_models_on_npz(
+                    model_filenames[component],
+                    output_filename,
+                    calibration_data_dir / component,
+                )
+                logging.info(
+                    f"{candidate_name} {component} component error: {stats}"
+                )
+            closed_loop_stats = compare_streaming_model_sets(
+                model_filenames,
+                candidate_filenames,
+                calibration_data_dir,
+            )
+            logging.info(
+                f"{candidate_name} closed-loop greedy error: {closed_loop_stats}"
+            )
 
 
 if __name__ == "__main__":

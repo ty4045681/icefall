@@ -58,7 +58,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AbstractSet, Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-
 # Unlike run.sh, dma-kws launches this file directly and does not inject the
 # icefall repository into PYTHONPATH.
 ZIPFORMER_RECIPE_DIR = Path(__file__).resolve().parent
@@ -121,6 +120,7 @@ GENERATED_MANIFEST_FIELDS = (
     "decode_mode",
     "chunk_size",
     "left_context_frames",
+    "keywords_threshold",
 )
 
 
@@ -136,8 +136,44 @@ def str2bool(value: Any) -> bool:
     raise argparse.ArgumentTypeError("expected one of: 0, 1, true, false")
 
 
+def parse_keywords_thresholds(value: str) -> List[float]:
+    """Parse and numerically deduplicate a threshold list."""
+    tokens = [item for item in re.split(r"[\s,]+", str(value).strip()) if item]
+    if not tokens:
+        raise ValueError("--keywords-thresholds must contain at least one value")
+    values: List[float] = []
+    seen = set()
+    for token in tokens:
+        try:
+            threshold = float(token)
+        except ValueError as error:
+            raise ValueError("invalid keyword threshold {!r}".format(token)) from error
+        if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+            raise ValueError(
+                "keyword thresholds must be finite values between 0 and 1: "
+                "{}".format(token)
+            )
+        if threshold == 0.0:
+            threshold = 0.0
+        canonical = format(threshold, ".12g")
+        if canonical not in seen:
+            values.append(float(canonical))
+            seen.add(canonical)
+    return sorted(values)
+
+
+def _format_threshold(value: float) -> str:
+    return format(float(value), ".12g")
+
+
+def _threshold_filename_tag(value: float) -> str:
+    text = _format_threshold(value).replace("-", "m").replace(".", "p")
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", text)
+
+
 def get_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         description=(
             "Run stateful streaming Zipformer KWS, or batch-decode a dma-kws "
             "manifest and export detected WAV clips."
@@ -211,6 +247,15 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--beam", "--beam-size", dest="beam", type=int, default=4)
     parser.add_argument("--keywords-score", type=float, default=None)
     parser.add_argument("--keywords-threshold", type=float, default=None)
+    parser.add_argument(
+        "--keywords-thresholds",
+        help=(
+            "Comma/space-separated acoustic thresholds for exact manifest-mode "
+            "scanning. The streaming encoder runs once and each threshold keeps "
+            "an independent decoder state. Cannot be combined with an explicit "
+            "--keywords-threshold."
+        ),
+    )
     parser.add_argument("--num-tailing-blanks", type=int, default=1)
     parser.add_argument("--blank-penalty", type=float, default=0.0)
     parser.add_argument(
@@ -417,11 +462,16 @@ def load_manifest(path: Path) -> Tuple[List[ManifestEntry], List[str]]:
             )
 
         for row_number, raw_row in enumerate(reader, start=2):
-            row = {str(key): "" if value is None else str(value) for key, value in raw_row.items()}
+            row = {
+                str(key): "" if value is None else str(value)
+                for key, value in raw_row.items()
+            }
             raw_audio_path = row["audio_path"].strip()
             keyword = row["keyword"].strip()
             if not raw_audio_path:
-                raise ValueError("manifest row {} has empty audio_path".format(row_number))
+                raise ValueError(
+                    "manifest row {} has empty audio_path".format(row_number)
+                )
             if not keyword:
                 raise ValueError("manifest row {} has empty keyword".format(row_number))
 
@@ -514,18 +564,25 @@ def _safe_stem(path: Path) -> str:
 
 
 def make_clip_filename(
-    entry: ManifestEntry, hit_index: int, bounds: ClipBounds
+    entry: ManifestEntry,
+    hit_index: int,
+    bounds: ClipBounds,
+    keyword_threshold: Optional[float] = None,
 ) -> str:
     digest = hashlib.sha1(str(entry.audio_path).encode("utf-8")).hexdigest()[:8]
-    return (
-        "row_{:08d}_{}_{}_hit_{:03d}_{:010d}_{:010d}.wav".format(
-            entry.row_number - 2,
-            _safe_stem(entry.audio_path),
-            digest,
-            hit_index,
-            bounds.start_sample,
-            bounds.end_sample,
-        )
+    threshold_tag = (
+        "_thr_{}".format(_threshold_filename_tag(keyword_threshold))
+        if keyword_threshold is not None
+        else ""
+    )
+    return "row_{:08d}_{}_{}{}_hit_{:03d}_{:010d}_{:010d}.wav".format(
+        entry.row_number - 2,
+        _safe_stem(entry.audio_path),
+        digest,
+        threshold_tag,
+        hit_index,
+        bounds.start_sample,
+        bounds.end_sample,
     )
 
 
@@ -600,9 +657,7 @@ def write_output_manifest(
     temporary = Path(temporary_name)
     try:
         with temporary.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(
-                handle, fieldnames=fields, extrasaction="ignore"
-            )
+            writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
         os.replace(str(temporary), str(path))
@@ -637,7 +692,9 @@ def validate_streaming_configuration(params: Mapping[str, Any]) -> str:
     if left_context <= 0:
         raise ValueError("streaming left_context_frames must be positive")
 
-    downsampling = _parse_int_tuple(params["downsampling_factor"], "downsampling_factor")
+    downsampling = _parse_int_tuple(
+        params["downsampling_factor"], "downsampling_factor"
+    )
     if any(chunk_size % factor for factor in downsampling):
         raise ValueError(
             "chunk_size={} must be divisible by every downsampling factor {}".format(
@@ -720,7 +777,9 @@ def _merge_model_args(
     for name in BOOL_MODEL_ARGS:
         values[name] = str2bool(values[name])
     if not values["use_transducer"]:
-        raise ValueError("keyword search requires a checkpoint with use_transducer=true")
+        raise ValueError(
+            "keyword search requires a checkpoint with use_transducer=true"
+        )
     return values
 
 
@@ -740,9 +799,7 @@ def _torch_load(path: Path, device: Any) -> Any:
     import torch
 
     try:
-        return torch.load(
-            str(path), map_location=device, weights_only=False
-        )
+        return torch.load(str(path), map_location=device, weights_only=False)
     except TypeError:
         # PyTorch releases before weights_only was added.
         return torch.load(str(path), map_location=device)
@@ -752,7 +809,9 @@ def _state_dict_from_checkpoint(
     checkpoint: Any, checkpoint_key: str
 ) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
     if not isinstance(checkpoint, Mapping):
-        raise ValueError("checkpoint must contain a state dict or an icefall checkpoint")
+        raise ValueError(
+            "checkpoint must contain a state dict or an icefall checkpoint"
+        )
 
     if "model" in checkpoint or "model_avg" in checkpoint:
         if checkpoint_key not in checkpoint or checkpoint[checkpoint_key] is None:
@@ -829,9 +888,7 @@ def _require_sentencepiece_unk_id(sp: Any) -> int:
 def _require_sentencepiece_piece(sp: Any, piece: str) -> int:
     token_id = _exact_sentencepiece_piece_id(sp, piece)
     if token_id is None:
-        raise ValueError(
-            "SentencePiece model has no exact {!r} token".format(piece)
-        )
+        raise ValueError("SentencePiece model has no exact {!r} token".format(piece))
     return token_id
 
 
@@ -839,7 +896,6 @@ def load_runtime(args: argparse.Namespace) -> LoadedRuntime:
     """Load checkpoint metadata first, then construct the matching model."""
     import sentencepiece as spm
     import torch
-
     from train import get_model, get_params
 
     config = _load_json_config(args.model_config)
@@ -859,9 +915,7 @@ def load_runtime(args: argparse.Namespace) -> LoadedRuntime:
         raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
     device = torch.device(args.device)
     checkpoint = _torch_load(checkpoint_path, torch.device("cpu"))
-    state_dict, metadata = _state_dict_from_checkpoint(
-        checkpoint, args.checkpoint_key
-    )
+    state_dict, metadata = _state_dict_from_checkpoint(checkpoint, args.checkpoint_key)
     state_dict = _remove_ddp_prefix(state_dict)
 
     model_args = _merge_model_args(metadata, config, args)
@@ -983,9 +1037,7 @@ def _parse_keyword_spec(value: str) -> Tuple[str, Any]:
     if not source:
         raise ValueError("keyword must not be empty")
 
-    tagged = re.match(
-        r"^(text|bpe_ids|bpe_pieces)\s*:(.*)$", source, re.I | re.S
-    )
+    tagged = re.match(r"^(text|bpe_ids|bpe_pieces)\s*:(.*)$", source, re.I | re.S)
     if tagged is not None:
         kind = tagged.group(1).lower()
         payload = tagged.group(2).strip()
@@ -1066,9 +1118,7 @@ def _validate_keyword_ids(
         special_id = _exact_sentencepiece_piece_id(sp, piece)
         if special_id is not None and special_id in token_ids:
             raise ValueError(
-                "keyword must not contain reserved token {}: {!r}".format(
-                    piece, source
-                )
+                "keyword must not contain reserved token {}: {!r}".format(piece, source)
             )
 
     for name in ("bos_id", "eos_id", "pad_id"):
@@ -1090,9 +1140,7 @@ def _validate_keyword_ids(
     return token_ids
 
 
-def _pieces_to_keyword_ids(
-    sp: Any, pieces: Sequence[str], *, source: str
-) -> List[int]:
+def _pieces_to_keyword_ids(sp: Any, pieces: Sequence[str], *, source: str) -> List[int]:
     if not pieces or any(not piece for piece in pieces):
         raise ValueError(
             "BPE piece list must not contain empty pieces: {!r}".format(source)
@@ -1112,8 +1160,10 @@ def _pieces_to_keyword_ids(
                 known_piece = str(id_to_piece(token_id))
             except (IndexError, RuntimeError):
                 known_piece = None
-        if token_id < 0 or token_id == unk_id or (
-            known_piece is not None and known_piece != piece
+        if (
+            token_id < 0
+            or token_id == unk_id
+            or (known_piece is not None and known_piece != piece)
         ):
             raise ValueError(
                 "BPE piece is not in the SentencePiece vocabulary: {!r} in {!r}".format(
@@ -1121,9 +1171,7 @@ def _pieces_to_keyword_ids(
                 )
             )
         token_ids.append(token_id)
-    return _validate_keyword_ids(
-        sp, token_ids, source=source, require_vocab_size=True
-    )
+    return _validate_keyword_ids(sp, token_ids, source=source, require_vocab_size=True)
 
 
 def _decode_keyword_ids(sp: Any, tokens: Sequence[int]) -> str:
@@ -1194,18 +1242,51 @@ def build_keywords_graph(
     score: float,
     threshold: float,
 ) -> Any:
-    from icefall import ContextGraph
-
     phrases, token_ids = encode_keywords(sp, keywords)
+    return _build_keywords_graph_from_encoded(
+        phrases=phrases,
+        token_ids=token_ids,
+        score=score,
+        threshold=threshold,
+    )
+
+
+def _build_keywords_graph_from_encoded(
+    *,
+    phrases: Sequence[str],
+    token_ids: Sequence[Sequence[int]],
+    score: float,
+    threshold: float,
+) -> Any:
+    from icefall import ContextGraph
 
     graph = ContextGraph(context_score=score, ac_threshold=threshold)
     graph.build(
-        token_ids=token_ids,
-        phrases=phrases,
+        token_ids=[list(tokens) for tokens in token_ids],
+        phrases=list(phrases),
         scores=[score] * len(phrases),
         ac_thresholds=[threshold] * len(phrases),
     )
     return graph
+
+
+def build_keywords_graphs(
+    sp: Any,
+    keywords: Sequence[str],
+    *,
+    score: float,
+    thresholds: Sequence[float],
+) -> Dict[float, Any]:
+    phrases, token_ids = encode_keywords(sp, keywords)
+    return {
+        float(threshold): _build_keywords_graph_from_encoded(
+            phrases=phrases,
+            token_ids=token_ids,
+            score=score,
+            threshold=float(threshold),
+        )
+        for threshold in thresholds
+    }
 
 
 class StatefulKeywordDecoder:
@@ -1248,9 +1329,7 @@ class StatefulKeywordDecoder:
             )
         )
 
-    def _matched_detection(
-        self, hyp: _DecoderHypothesis
-    ) -> Optional[Detection]:
+    def _matched_detection(self, hyp: _DecoderHypothesis) -> Optional[Detection]:
         matched, matched_state = self.keywords_graph.is_matched(hyp.context_state)
         if not matched or matched_state is None:
             return None
@@ -1268,12 +1347,18 @@ class StatefulKeywordDecoder:
 
     def advance(self, encoder_out: Any) -> List[Detection]:
         """Consume ``(1, T, C)`` encoder frames and preserve all search state."""
-        torch = self.torch
         if encoder_out.ndim != 3 or encoder_out.size(0) != 1:
             raise ValueError(
                 "StatefulKeywordDecoder expects encoder_out shape (1, T, C)"
             )
         projected = self.model.joiner.encoder_proj(encoder_out)
+        return self.advance_projected(projected)
+
+    def advance_projected(self, projected: Any) -> List[Detection]:
+        """Consume a shared joiner encoder projection and preserve state."""
+        if projected.ndim != 3 or projected.size(0) != 1:
+            raise ValueError("StatefulKeywordDecoder expects projected shape (1, T, C)")
+        torch = self.torch
         detections: List[Detection] = []
 
         for local_t in range(projected.size(1)):
@@ -1291,9 +1376,11 @@ class StatefulKeywordDecoder:
             decoder_out = self.model.joiner.decoder_proj(decoder_out)
             current_encoder = projected[:, local_t : local_t + 1, :].unsqueeze(2)
             current_encoder = current_encoder.expand(len(active), -1, -1, -1)
-            logits = self.model.joiner(
-                current_encoder, decoder_out, project_input=False
-            ).squeeze(1).squeeze(1)
+            logits = (
+                self.model.joiner(current_encoder, decoder_out, project_input=False)
+                .squeeze(1)
+                .squeeze(1)
+            )
             if self.blank_penalty:
                 logits[:, self.blank_id] -= self.blank_penalty
 
@@ -1327,14 +1414,12 @@ class StatefulKeywordDecoder:
                         context_score,
                         new_context_state,
                         _,
-                    ) = self.keywords_graph.forward_one_step(
-                        hyp.context_state, token
-                    )
+                    ) = self.keywords_graph.forward_one_step(hyp.context_state, token)
                     tailing_blanks = 0
                     if new_context_state.token == -1:
-                        new_ys[-self.context_size :] = [
-                            -1
-                        ] * (self.context_size - 1) + [self.blank_id]
+                        new_ys[-self.context_size :] = [-1] * (
+                            self.context_size - 1
+                        ) + [self.blank_id]
 
                 next_hypotheses.add(
                     _DecoderHypothesis(
@@ -1370,6 +1455,50 @@ class StatefulKeywordDecoder:
             return []
         self._reset_hypotheses()
         return [detection]
+
+
+class MultiThresholdKeywordDecoder:
+    """Fan out one encoder projection to independent threshold decoders."""
+
+    def __init__(
+        self,
+        *,
+        model: Any,
+        keywords_graphs: Mapping[float, Any],
+        beam: int,
+        num_tailing_blanks: int,
+        blank_penalty: float,
+    ) -> None:
+        if not keywords_graphs:
+            raise ValueError("at least one keyword threshold is required")
+        self.model = model
+        self.decoders = {
+            float(threshold): StatefulKeywordDecoder(
+                model=model,
+                keywords_graph=graph,
+                beam=beam,
+                num_tailing_blanks=num_tailing_blanks,
+                blank_penalty=blank_penalty,
+            )
+            for threshold, graph in sorted(keywords_graphs.items())
+        }
+
+    def advance(self, encoder_out: Any) -> Dict[float, List[Detection]]:
+        if encoder_out.ndim != 3 or encoder_out.size(0) != 1:
+            raise ValueError(
+                "MultiThresholdKeywordDecoder expects encoder_out shape (1, T, C)"
+            )
+        projected = self.model.joiner.encoder_proj(encoder_out)
+        return {
+            threshold: decoder.advance_projected(projected)
+            for threshold, decoder in self.decoders.items()
+        }
+
+    def finalize(self) -> Dict[float, List[Detection]]:
+        return {
+            threshold: decoder.finalize()
+            for threshold, decoder in self.decoders.items()
+        }
 
 
 def get_init_states(model: Any, device: Any) -> List[Any]:
@@ -1415,9 +1544,7 @@ def streaming_forward(
     processed_lens = states[-1]
     processed_mask = (processed_lens.unsqueeze(1) <= processed_mask).flip(1)
     new_processed_lens = processed_lens + x_lens
-    src_key_padding_mask = torch.cat(
-        [processed_mask, src_key_padding_mask], dim=1
-    )
+    src_key_padding_mask = torch.cat([processed_mask, src_key_padding_mask], dim=1)
 
     encoder_out, encoder_out_lens, new_encoder_states = model.encoder.streaming_forward(
         x=x.permute(1, 0, 2),
@@ -1438,9 +1565,7 @@ def load_audio(path: Path, sample_rate: int = SAMPLE_RATE) -> Any:
     import soundfile as sf
     import torch
 
-    data, source_sample_rate = sf.read(
-        str(path), dtype="float32", always_2d=True
-    )
+    data, source_sample_rate = sf.read(str(path), dtype="float32", always_2d=True)
     if data.shape[0] == 0:
         raise ValueError("audio is empty: {}".format(path))
     waveform = torch.from_numpy(data).mean(dim=1).contiguous()
@@ -1455,9 +1580,7 @@ def load_audio(path: Path, sample_rate: int = SAMPLE_RATE) -> Any:
                     source_sample_rate, sample_rate, path
                 )
             ) from error
-        waveform = audio_functional.resample(
-            waveform, source_sample_rate, sample_rate
-        )
+        waveform = audio_functional.resample(waveform, source_sample_rate, sample_rate)
     return waveform.contiguous()
 
 
@@ -1478,44 +1601,52 @@ def compute_fbank(waveform: Any, device: Any) -> Any:
     return features
 
 
-def run_keyword_inference(
+def run_keyword_inference_multi_threshold(
     *,
     runtime: LoadedRuntime,
     features: Any,
-    keywords_graph: Any,
+    keywords_graphs: Mapping[float, Any],
     args: argparse.Namespace,
-) -> List[Detection]:
+) -> Dict[float, List[Detection]]:
     import torch
 
-    decoder = StatefulKeywordDecoder(
+    decoder_bank = MultiThresholdKeywordDecoder(
         model=runtime.model,
-        keywords_graph=keywords_graph,
+        keywords_graphs=keywords_graphs,
         beam=args.beam,
         num_tailing_blanks=args.num_tailing_blanks,
         blank_penalty=args.blank_penalty,
     )
     device = next(runtime.model.parameters()).device
     tail_frames = round(args.tail_padding_sec * 1000.0 / FBANK_FRAME_SHIFT_MS)
-    detections: List[Detection] = []
+    detections: Dict[float, List[Detection]] = {
+        float(threshold): [] for threshold in keywords_graphs
+    }
+
+    def advance_all(encoder_out: Any) -> None:
+        for threshold, values in decoder_bank.advance(encoder_out).items():
+            detections[threshold].extend(values)
+
+    def finalize_all() -> None:
+        for threshold, values in decoder_bank.finalize().items():
+            detections[threshold].extend(values)
 
     if runtime.decode_mode == "offline":
         if features.size(0) < ENCODER_EMBED_PAD:
-            return []
+            return detections
         padded = features
         if runtime.params.causal and tail_frames:
             padded = torch.nn.functional.pad(
                 padded, (0, 0, 0, tail_frames), value=LOG_EPS
             )
-        feature_lens = torch.tensor(
-            [padded.size(0)], dtype=torch.int64, device=device
-        )
+        feature_lens = torch.tensor([padded.size(0)], dtype=torch.int64, device=device)
         encoder_out, encoder_out_lens = runtime.model.forward_encoder(
             padded.unsqueeze(0), feature_lens
         )
         valid = int(encoder_out_lens[0].item())
         if valid:
-            detections.extend(decoder.advance(encoder_out[:, :valid, :]))
-        detections.extend(decoder.finalize())
+            advance_all(encoder_out[:, :valid, :])
+        finalize_all()
         return detections
 
     chunk_size = int(runtime.params.chunk_size)
@@ -1535,16 +1666,12 @@ def run_keyword_inference(
         position += feature_step
         if segment_length < required_segment:
             extra = required_segment - segment_length
-            segment = torch.nn.functional.pad(
-                segment, (0, 0, 0, extra), value=LOG_EPS
-            )
+            segment = torch.nn.functional.pad(segment, (0, 0, 0, extra), value=LOG_EPS)
             # streaming_decode.py treats the final synthetic pad as valid so
             # that the encoder always returns a complete final chunk.
             segment_length += extra
 
-        feature_lens = torch.tensor(
-            [segment_length], dtype=torch.int64, device=device
-        )
+        feature_lens = torch.tensor([segment_length], dtype=torch.int64, device=device)
         encoder_out, encoder_out_lens, states = streaming_forward(
             features=segment.unsqueeze(0),
             feature_lens=feature_lens,
@@ -1555,10 +1682,27 @@ def run_keyword_inference(
         )
         valid = int(encoder_out_lens[0].item())
         if valid:
-            detections.extend(decoder.advance(encoder_out[:, :valid, :]))
+            advance_all(encoder_out[:, :valid, :])
 
-    detections.extend(decoder.finalize())
+    finalize_all()
     return detections
+
+
+def run_keyword_inference(
+    *,
+    runtime: LoadedRuntime,
+    features: Any,
+    keywords_graph: Any,
+    args: argparse.Namespace,
+) -> List[Detection]:
+    """Backward-compatible single-threshold inference wrapper."""
+    threshold = float(runtime.keywords_threshold)
+    return run_keyword_inference_multi_threshold(
+        runtime=runtime,
+        features=features,
+        keywords_graphs={threshold: keywords_graph},
+        args=args,
+    )[threshold]
 
 
 def _write_wav_atomic(path: Path, waveform: Any, overwrite: bool) -> None:
@@ -1599,6 +1743,7 @@ def _manifest_output_row(
     clip_path: Path,
     output_manifest: Path,
     runtime: LoadedRuntime,
+    keyword_threshold: float,
 ) -> Dict[str, Any]:
     row: Dict[str, Any] = dict(entry.row)
     for name in GENERATED_MANIFEST_FIELDS:
@@ -1631,6 +1776,7 @@ def _manifest_output_row(
             "decode_mode": runtime.decode_mode,
             "chunk_size": runtime.params.chunk_size,
             "left_context_frames": runtime.params.left_context_frames,
+            "keywords_threshold": _format_threshold(keyword_threshold),
         }
     )
     return row
@@ -1650,6 +1796,11 @@ def _keywords_for_single_wav(
 def run_single_wav(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
     import torch
 
+    if args.keywords_thresholds is not None:
+        raise ValueError(
+            "--keywords-thresholds is supported only with --manifest; "
+            "use --keywords-threshold for --wav"
+        )
     wav_path = args.wav.expanduser().resolve()
     if not wav_path.is_file():
         raise FileNotFoundError("input audio not found: {}".format(wav_path))
@@ -1662,9 +1813,7 @@ def run_single_wav(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
     )
     waveform = load_audio(wav_path)
     with torch.inference_mode():
-        features = compute_fbank(
-            waveform, next(runtime.model.parameters()).device
-        )
+        features = compute_fbank(waveform, next(runtime.model.parameters()).device)
         detections = run_keyword_inference(
             runtime=runtime,
             features=features,
@@ -1722,10 +1871,24 @@ def _ensure_output_is_not_protected(
         )
 
 
+def _manifest_thresholds(
+    args: argparse.Namespace, runtime: LoadedRuntime
+) -> List[float]:
+    if args.keywords_thresholds is None:
+        return [float(runtime.keywords_threshold)]
+    if args.keywords_threshold is not None:
+        raise ValueError(
+            "--keywords-thresholds cannot be combined with --keywords-threshold"
+        )
+    return parse_keywords_thresholds(args.keywords_thresholds)
+
+
 def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
     import torch
 
     _, wav_root, output_manifest = _validate_output_layout(args)
+    thresholds = _manifest_thresholds(args, runtime)
+    multi_threshold_mode = args.keywords_thresholds is not None
     input_manifest = args.manifest.expanduser().resolve()
     if output_manifest == input_manifest:
         raise ValueError("output manifest must not overwrite the input manifest")
@@ -1736,15 +1899,13 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
         {input_manifest}.union(source_audio_paths),
         "output manifest",
     )
-    protected_clip_paths = {input_manifest, output_manifest}.union(
-        source_audio_paths
-    )
+    protected_clip_paths = {input_manifest, output_manifest}.union(source_audio_paths)
     logging.info("Loaded %s manifest rows from %s", len(entries), args.manifest)
 
-    graph_cache: Dict[str, Any] = {}
+    graph_cache: Dict[str, Dict[float, Any]] = {}
     output_rows: List[Dict[str, Any]] = []
     errors: List[Tuple[int, str, str]] = []
-    miss_count = 0
+    miss_trial_count = 0
 
     for index, entry in enumerate(entries, start=1):
         try:
@@ -1752,68 +1913,78 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
                 raise FileNotFoundError(
                     "audio file not found: {}".format(entry.audio_path)
                 )
-            graph = graph_cache.get(entry.keyword)
-            if graph is None:
-                graph = build_keywords_graph(
+            graphs = graph_cache.get(entry.keyword)
+            if graphs is None:
+                graphs = build_keywords_graphs(
                     runtime.sp,
                     [entry.keyword],
                     score=runtime.keywords_score,
-                    threshold=runtime.keywords_threshold,
+                    thresholds=thresholds,
                 )
-                graph_cache[entry.keyword] = graph
+                graph_cache[entry.keyword] = graphs
 
             waveform = load_audio(entry.audio_path)
             with torch.inference_mode():
                 features = compute_fbank(
                     waveform, next(runtime.model.parameters()).device
                 )
-                detections = run_keyword_inference(
+                detections_by_threshold = run_keyword_inference_multi_threshold(
                     runtime=runtime,
                     features=features,
-                    keywords_graph=graph,
+                    keywords_graphs=graphs,
                     args=args,
                 )
-            detections.sort(key=lambda item: (item.start_frame, item.end_frame))
-            written = 0
-            for hit_index, detection in enumerate(detections):
-                bounds = compute_clip_bounds(
-                    detection,
-                    num_samples=waveform.numel(),
-                    sample_rate=SAMPLE_RATE,
-                    pre_roll_sec=args.pre_roll_sec,
-                    post_roll_sec=args.post_roll_sec,
-                )
-                if bounds is None:
-                    logging.warning(
-                        "Ignoring out-of-range hit in manifest row %s: %s",
-                        entry.row_number,
-                        detection.timestamp_frames,
+            for threshold in thresholds:
+                detections = detections_by_threshold[threshold]
+                detections.sort(key=lambda item: (item.start_frame, item.end_frame))
+                written = 0
+                for hit_index, detection in enumerate(detections):
+                    bounds = compute_clip_bounds(
+                        detection,
+                        num_samples=waveform.numel(),
+                        sample_rate=SAMPLE_RATE,
+                        pre_roll_sec=args.pre_roll_sec,
+                        post_roll_sec=args.post_roll_sec,
                     )
-                    continue
-                filename = make_clip_filename(entry, hit_index, bounds)
-                clip_path = wav_root / filename
-                _ensure_output_is_not_protected(
-                    clip_path, protected_clip_paths, "output WAV"
-                )
-                _write_wav_atomic(
-                    clip_path,
-                    waveform[bounds.start_sample : bounds.end_sample],
-                    args.overwrite,
-                )
-                output_rows.append(
-                    _manifest_output_row(
-                        entry=entry,
-                        detection=detection,
-                        hit_index=hit_index,
-                        bounds=bounds,
-                        clip_path=clip_path,
-                        output_manifest=output_manifest,
-                        runtime=runtime,
+                    if bounds is None:
+                        logging.warning(
+                            "Ignoring out-of-range hit in manifest row %s "
+                            "at threshold %s: %s",
+                            entry.row_number,
+                            _format_threshold(threshold),
+                            detection.timestamp_frames,
+                        )
+                        continue
+                    filename = make_clip_filename(
+                        entry,
+                        hit_index,
+                        bounds,
+                        keyword_threshold=(threshold if multi_threshold_mode else None),
                     )
-                )
-                written += 1
-            if written == 0:
-                miss_count += 1
+                    clip_path = wav_root / filename
+                    _ensure_output_is_not_protected(
+                        clip_path, protected_clip_paths, "output WAV"
+                    )
+                    _write_wav_atomic(
+                        clip_path,
+                        waveform[bounds.start_sample : bounds.end_sample],
+                        args.overwrite,
+                    )
+                    output_rows.append(
+                        _manifest_output_row(
+                            entry=entry,
+                            detection=detection,
+                            hit_index=hit_index,
+                            bounds=bounds,
+                            clip_path=clip_path,
+                            output_manifest=output_manifest,
+                            runtime=runtime,
+                            keyword_threshold=threshold,
+                        )
+                    )
+                    written += 1
+                if written == 0:
+                    miss_trial_count += 1
         except Exception as error:
             if args.fail_fast:
                 raise
@@ -1822,11 +1993,11 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
 
         if index % 100 == 0 or index == len(entries):
             logging.info(
-                "Processed %s/%s rows; clips=%s, misses=%s, errors=%s",
+                "Processed %s/%s rows; clips=%s, missed-trials=%s, errors=%s",
                 index,
                 len(entries),
                 len(output_rows),
-                miss_count,
+                miss_trial_count,
                 len(errors),
             )
 
@@ -1837,11 +2008,12 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
         overwrite=args.overwrite,
     )
     logging.info(
-        "Wrote %s clips and %s to %s (misses=%s, errors=%s)",
+        "Wrote %s clips and %s to %s " "(thresholds=%s, missed-trials=%s, errors=%s)",
         len(output_rows),
         "manifest row" if len(output_rows) == 1 else "manifest rows",
         output_manifest,
-        miss_count,
+        ",".join(_format_threshold(value) for value in thresholds),
+        miss_trial_count,
         len(errors),
     )
     if errors:
@@ -1856,6 +2028,16 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = get_parser().parse_args(argv)
+    if args.keywords_thresholds is not None:
+        if args.keywords_threshold is not None:
+            raise ValueError(
+                "--keywords-thresholds cannot be combined with --keywords-threshold"
+            )
+        if args.wav is not None:
+            raise ValueError(
+                "--keywords-thresholds is supported only with --manifest; "
+                "use --keywords-threshold for --wav"
+            )
     runtime = load_runtime(args)
     if args.wav is not None:
         return run_single_wav(args, runtime)

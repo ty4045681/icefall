@@ -5,7 +5,7 @@ import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
-
+from types import SimpleNamespace
 
 SCRIPT = Path(__file__).with_name("streaming_kws.py")
 SPEC = importlib.util.spec_from_file_location("streaming_kws", SCRIPT)
@@ -51,12 +51,28 @@ class FakeSentencePiece:
         return values.get(phrase, [self.unk_id()])
 
     def decode(self, token_ids):
-        return "".join(self.pieces[token_id] for token_id in token_ids).replace(
-            "\u2581", " "
-        ).strip()
+        return (
+            "".join(self.pieces[token_id] for token_id in token_ids)
+            .replace("\u2581", " ")
+            .strip()
+        )
 
 
 class TestManifestAndTimestamps(unittest.TestCase):
+    def test_keyword_threshold_list_is_sorted_and_numerically_deduplicated(self):
+        self.assertEqual(
+            MODULE.parse_keywords_thresholds(
+                "0.8, 0.25 0.80,0.3,0.30000000000000004,0,1"
+            ),
+            [0.0, 0.25, 0.3, 0.8, 1.0],
+        )
+
+    def test_keyword_threshold_list_rejects_empty_invalid_and_out_of_range(self):
+        for value in ("", "not-a-number", "nan", "inf", "-0.01", "1.01"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    MODULE.parse_keywords_thresholds(value)
+
     def test_manifest_paths_are_relative_to_csv_and_metadata_is_retained(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -137,9 +153,7 @@ class TestManifestAndTimestamps(unittest.TestCase):
         self.assertAlmostEqual(bounds.raw_end_sec, 1.64)
 
     def test_frame_span_clamps_to_audio(self):
-        detection = MODULE.Detection(
-            phrase="WAKE", timestamp_frames=[0], score=1.0
-        )
+        detection = MODULE.Detection(phrase="WAKE", timestamp_frames=[0], score=1.0)
         bounds = MODULE.compute_clip_bounds(
             detection,
             num_samples=400,
@@ -200,6 +214,45 @@ class TestManifestAndTimestamps(unittest.TestCase):
             MODULE.make_clip_filename(second, 0, bounds),
         )
 
+    def test_multi_threshold_clip_name_contains_threshold_tag(self):
+        row = {"audio_path": "sample.wav", "keyword": "wake"}
+        entry = MODULE.ManifestEntry(2, row, Path("/a/sample.wav"), "wake", 0)
+        bounds = MODULE.ClipBounds(0, 640, 0, 640, 16000)
+
+        scalar_name = MODULE.make_clip_filename(entry, 0, bounds)
+        scanned_name = MODULE.make_clip_filename(entry, 0, bounds, 0.625)
+
+        self.assertNotIn("_thr_", scalar_name)
+        self.assertIn("_thr_0p625_hit_000_", scanned_name)
+
+    def test_manifest_hit_row_records_the_threshold_used(self):
+        entry = MODULE.ManifestEntry(
+            3,
+            {"audio_path": "sample.wav", "keyword": "wake", "label": "0"},
+            Path("/input/sample.wav"),
+            "wake",
+            0,
+        )
+        detection = MODULE.Detection("WAKE", [1, 2], 0.9)
+        bounds = MODULE.ClipBounds(640, 1920, 0, 2560, 16000)
+        runtime = SimpleNamespace(
+            decode_mode="streaming",
+            params=SimpleNamespace(chunk_size=16, left_context_frames=64),
+        )
+
+        row = MODULE._manifest_output_row(
+            entry=entry,
+            detection=detection,
+            hit_index=0,
+            bounds=bounds,
+            clip_path=Path("/output/wavs/clip.wav"),
+            output_manifest=Path("/output/manifest.csv"),
+            runtime=runtime,
+            keyword_threshold=0.625,
+        )
+
+        self.assertEqual(row["keywords_threshold"], "0.625")
+
     def test_empty_output_manifest_has_a_valid_header(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "manifest.csv"
@@ -212,12 +265,15 @@ class TestManifestAndTimestamps(unittest.TestCase):
             with output.open("r", encoding="utf-8", newline="") as handle:
                 reader = csv.DictReader(handle)
                 self.assertEqual(list(reader), [])
-                self.assertEqual(reader.fieldnames[:4], [
-                    "audio_path",
-                    "keyword",
-                    "label",
-                    "text_variant",
-                ])
+                self.assertEqual(
+                    reader.fieldnames[:4],
+                    [
+                        "audio_path",
+                        "keyword",
+                        "label",
+                        "text_variant",
+                    ],
+                )
 
     def test_atomic_manifest_write_does_not_clobber_fixed_tmp_sidecar(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -259,9 +315,7 @@ class TestManifestAndTimestamps(unittest.TestCase):
                     )
 
             safe = root / "wavs" / "generated.wav"
-            MODULE._ensure_output_is_not_protected(
-                safe, protected, "generated output"
-            )
+            MODULE._ensure_output_is_not_protected(safe, protected, "generated output")
 
     def test_training_policy_requires_explicit_deployment_point(self):
         parser = MODULE.get_parser()
@@ -463,11 +517,11 @@ class TestStatefulKeywordDecoder(unittest.TestCase):
             self.ac_threshold = threshold
 
     class Graph:
-        def __init__(self):
+        def __init__(self, threshold=0.5):
             self.root = TestStatefulKeywordDecoder.State()
             self.first = TestStatefulKeywordDecoder.State((1,))
             self.matched = TestStatefulKeywordDecoder.State(
-                (1, 2), phrase="WAKE", threshold=0.5
+                (1, 2), phrase="WAKE", threshold=threshold
             )
 
         def forward_one_step(self, state, token):
@@ -478,9 +532,13 @@ class TestStatefulKeywordDecoder(unittest.TestCase):
             return 0.0, self.root, None
 
         def is_matched(self, state):
-            return (state is self.matched, self.matched if state is self.matched else None)
+            return (
+                state is self.matched,
+                self.matched if state is self.matched else None,
+            )
 
     if torch is not None:
+
         class Decoder(torch.nn.Module):
             blank_id = 0
             context_size = 1
@@ -492,7 +550,12 @@ class TestStatefulKeywordDecoder(unittest.TestCase):
                 )
 
         class Joiner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.encoder_proj_calls = 0
+
             def encoder_proj(self, value):
+                self.encoder_proj_calls += 1
                 return value
 
             def decoder_proj(self, value):
@@ -510,6 +573,11 @@ class TestStatefulKeywordDecoder(unittest.TestCase):
                 self.anchor = torch.nn.Parameter(torch.zeros(()))
                 self.decoder = TestStatefulKeywordDecoder.Decoder()
                 self.joiner = TestStatefulKeywordDecoder.Joiner()
+                self.forward_encoder_calls = 0
+
+            def forward_encoder(self, features, feature_lens):
+                self.forward_encoder_calls += 1
+                return features, feature_lens
 
     def test_keyword_and_trailing_blanks_can_cross_chunk_boundaries(self):
         decoder = MODULE.StatefulKeywordDecoder(
@@ -536,6 +604,78 @@ class TestStatefulKeywordDecoder(unittest.TestCase):
         self.assertEqual(hits[0].phrase, "WAKE")
         self.assertEqual(hits[0].timestamp_frames, [0, 1])
         self.assertGreater(hits[0].score, 0.99)
+
+    def test_multi_threshold_decoder_projects_once_and_keeps_independent_state(self):
+        model = self.Model()
+        low_graph = self.Graph(0.5)
+        high_graph = self.Graph(1.0)
+        decoder = MODULE.MultiThresholdKeywordDecoder(
+            model=model,
+            keywords_graphs={0.5: low_graph, 1.0: high_graph},
+            beam=1,
+            num_tailing_blanks=1,
+            blank_penalty=0.0,
+        )
+        chunks = [
+            torch.tensor([[[-8.0, 8.0, -8.0, -8.0]]]),
+            torch.tensor([[[-8.0, -8.0, 8.0, -8.0]]]),
+            torch.tensor([[[8.0, -8.0, -8.0, -8.0]]]),
+            torch.tensor([[[8.0, -8.0, -8.0, -8.0]]]),
+        ]
+
+        hits = {0.5: [], 1.0: []}
+        for chunk in chunks:
+            for threshold, values in decoder.advance(chunk).items():
+                hits[threshold].extend(values)
+
+        self.assertEqual(model.joiner.encoder_proj_calls, len(chunks))
+        self.assertEqual(len(hits[0.5]), 1)
+        self.assertEqual(hits[1.0], [])
+        # The accepted decoder resets after its hit; the rejected decoder
+        # remains at the matched graph state. Their search state is not shared.
+        self.assertIs(
+            decoder.decoders[0.5].hypotheses.most_probable().context_state,
+            low_graph.root,
+        )
+        self.assertIs(
+            decoder.decoders[1.0].hypotheses.most_probable().context_state,
+            high_graph.matched,
+        )
+
+    def test_offline_multi_threshold_inference_runs_encoder_once(self):
+        model = self.Model()
+        runtime = MODULE.LoadedRuntime(
+            model=model,
+            sp=None,
+            params=SimpleNamespace(causal=False),
+            checkpoint_path=Path("checkpoint.pt"),
+            decode_mode="offline",
+            keywords_score=1.0,
+            keywords_threshold=0.5,
+            config={},
+        )
+        args = SimpleNamespace(
+            beam=1,
+            num_tailing_blanks=1,
+            blank_penalty=0.0,
+            tail_padding_sec=0.0,
+        )
+        features = torch.full((MODULE.ENCODER_EMBED_PAD, 4), -8.0)
+        features[:, 0] = 8.0
+        features[0] = torch.tensor([-8.0, 8.0, -8.0, -8.0])
+        features[1] = torch.tensor([-8.0, -8.0, 8.0, -8.0])
+
+        hits = MODULE.run_keyword_inference_multi_threshold(
+            runtime=runtime,
+            features=features,
+            keywords_graphs={0.5: self.Graph(0.5), 1.0: self.Graph(1.0)},
+            args=args,
+        )
+
+        self.assertEqual(model.forward_encoder_calls, 1)
+        self.assertEqual(model.joiner.encoder_proj_calls, 1)
+        self.assertEqual(len(hits[0.5]), 1)
+        self.assertEqual(hits[1.0], [])
 
 
 if __name__ == "__main__":

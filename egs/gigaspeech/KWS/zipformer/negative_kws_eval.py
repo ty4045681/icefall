@@ -19,6 +19,7 @@
 The inference and reporting layers are deliberately separate:
 
 * ``prepare`` recursively creates a negative-only dma-kws manifest.
+* ``prepare-features`` incrementally caches one CPU Fbank per unique audio.
 * ``sweep`` validates exposure, invokes ``streaming_kws.py`` exactly once for
   all requested thresholds, then builds the report.
 * ``report`` rebuilds metrics and charts from an existing run without model
@@ -31,11 +32,13 @@ multiple false-alarm events, but is counted as triggered at most once.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import hashlib
 import html
 import json
 import math
+import multiprocessing
 import os
 import re
 import subprocess
@@ -48,6 +51,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import (
     Any,
+    Callable,
     DefaultDict,
     Dict,
     Iterable,
@@ -59,6 +63,20 @@ from typing import (
 )
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from kws_feature_cache import (  # noqa: E402
+    FbankFeatureCache,
+    prepare_cached_fbank,
+)
+from kws_progress import (  # noqa: E402
+    PROGRESS_EVENT_ENV,
+    PROGRESS_EVENT_PREFIX,
+    ConsoleProgress,
+    parse_progress_event,
+)
+
 DEFAULT_DECODE_SCRIPT = SCRIPT_DIR / "streaming_kws.py"
 RUN_SCHEMA_VERSION = 1
 UNCATEGORIZED = "uncategorized"
@@ -108,6 +126,8 @@ OWNED_DECODER_ARGS = {
     "--keywords-thresholds",
     "--fail-fast",
     "--overwrite",
+    "--progress",
+    "--no-progress",
 }
 
 
@@ -417,6 +437,96 @@ def prepare_manifest(args: argparse.Namespace) -> int:
             len(rows), len(audio_paths), output_manifest
         )
     )
+    return 0
+
+
+def prepare_features(args: argparse.Namespace) -> int:
+    """Incrementally cache one CPU Fbank matrix per unique manifest audio."""
+    import streaming_kws
+
+    if args.num_workers <= 0:
+        raise EvaluationError("--num-workers must be positive")
+    entries, _ = streaming_kws.load_manifest(args.manifest)
+    audio_paths = list(dict.fromkeys(entry.audio_path for entry in entries))
+    FbankFeatureCache(args.feature_cache_dir)
+    display = ConsoleProgress(
+        total=len(audio_paths),
+        description="KWS feature cache",
+        enabled=getattr(args, "progress", None),
+        unit="files",
+    )
+    counts = {"cached": 0, "computed": 0, "errors": 0}
+    errors = []
+
+    def record(path: Path, result: Optional[Mapping[str, Any]], error: Any) -> None:
+        if error is not None:
+            counts["errors"] += 1
+            errors.append((path, str(error)))
+            logging.error("Failed to cache %s: %s", path, error)
+        elif result is not None:
+            status = str(result.get("status", "computed"))
+            counts[status if status in counts else "computed"] += 1
+        completed = sum(counts.values())
+        display.update(
+            completed=completed,
+            status="cached={} computed={} errors={}".format(
+                counts["cached"], counts["computed"], counts["errors"]
+            ),
+        )
+
+    display.start()
+    try:
+        if args.num_workers == 1:
+            for audio_path in audio_paths:
+                try:
+                    result = prepare_cached_fbank(
+                        str(audio_path),
+                        str(args.feature_cache_dir),
+                        args.force,
+                    )
+                except Exception as error:
+                    record(audio_path, None, error)
+                else:
+                    record(audio_path, result, None)
+        else:
+            context = multiprocessing.get_context("spawn")
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=args.num_workers,
+                mp_context=context,
+            ) as executor:
+                pending = {
+                    executor.submit(
+                        prepare_cached_fbank,
+                        str(audio_path),
+                        str(args.feature_cache_dir),
+                        args.force,
+                    ): audio_path
+                    for audio_path in audio_paths
+                }
+                for future in concurrent.futures.as_completed(pending):
+                    audio_path = pending[future]
+                    try:
+                        result = future.result()
+                    except Exception as error:
+                        record(audio_path, None, error)
+                    else:
+                        record(audio_path, result, None)
+    finally:
+        display.stop()
+
+    print(
+        "Feature cache: {} unique files, {} reused, {} computed, {} errors: {}".format(
+            len(audio_paths),
+            counts["cached"],
+            counts["computed"],
+            counts["errors"],
+            args.feature_cache_dir.expanduser().resolve(),
+        )
+    )
+    if errors:
+        preview = "; ".join("{}: {}".format(path, error) for path, error in errors[:5])
+        logging.error("Feature cache failures: %s", preview)
+        return 2
     return 0
 
 
@@ -737,7 +847,11 @@ def _validate_managed_output_paths(
             )
 
 
-def _run_decoder(command: Sequence[str], log_path: Path) -> int:
+def _run_decoder(
+    command: Sequence[str],
+    log_path: Path,
+    on_progress: Optional[Callable[[Mapping[str, Any]], None]] = None,
+) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         dir=str(log_path.parent), prefix=".runner-", suffix=".tmp.log"
@@ -745,17 +859,68 @@ def _run_decoder(command: Sequence[str], log_path: Path) -> int:
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", errors="replace") as log:
-            completed = subprocess.run(
-                list(command),
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                shell=False,
-                check=False,
-            )
+            environment = dict(os.environ)
+            environment.pop(PROGRESS_EVENT_ENV, None)
+            if on_progress is None:
+                completed = subprocess.run(
+                    list(command),
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    shell=False,
+                    check=False,
+                    env=environment,
+                )
+                return_code = int(completed.returncode)
+            else:
+                environment[PROGRESS_EVENT_ENV] = "1"
+                process = subprocess.Popen(
+                    list(command),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    shell=False,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    env=environment,
+                )
+                assert process.stdout is not None
+                progress_callback = on_progress
+                try:
+                    with process.stdout:
+                        for line in process.stdout:
+                            event = parse_progress_event(line)
+                            if event is None:
+                                log.write(line)
+                            elif progress_callback is not None:
+                                try:
+                                    progress_callback(event)
+                                except Exception as error:
+                                    log.write(
+                                        "progress display disabled after error: "
+                                        "{}\n".format(error)
+                                    )
+                                    progress_callback = None
+                    return_code = int(process.wait())
+                except BaseException:
+                    if process.poll() is None:
+                        try:
+                            process.terminate()
+                        except OSError:
+                            pass
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            process.kill()
+                        except OSError:
+                            pass
+                        process.wait()
+                    raise
             log.flush()
             os.fsync(log.fileno())
         os.replace(str(temporary), str(log_path))
-        return int(completed.returncode)
+        return return_code
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -981,8 +1146,36 @@ def run_sweep(args: argparse.Namespace) -> int:
         "report_dir": "report",
     }
     _atomic_write_json(run_path, run_record, overwrite=True)
+    display = ConsoleProgress(
+        total=len(exposure),
+        description="KWS negative evaluation",
+        enabled=getattr(args, "progress", None),
+        unit="trials",
+    )
+
+    def update_progress(event: Mapping[str, Any]) -> None:
+        if int(event.get("total", -1)) != len(exposure):
+            return
+        display.update(
+            completed=int(event["completed"]),
+            status="clips={} misses={} errors={}".format(
+                event.get("clips", 0),
+                event.get("misses", 0),
+                event.get("errors", 0),
+            ),
+        )
+
+    display.start()
     try:
-        return_code = _run_decoder(command, log_path)
+        return_code = _run_decoder(
+            command,
+            log_path,
+            on_progress=update_progress if display.enabled else None,
+        )
+        if return_code == 0 and event_manifest.is_file():
+            display.complete(
+                status="{} thresholds; inference complete".format(len(thresholds))
+            )
     except OSError as error:
         run_record.update(
             {
@@ -995,6 +1188,23 @@ def run_sweep(args: argparse.Namespace) -> int:
         raise EvaluationError(
             "could not start streaming inference: {}".format(error)
         ) from error
+    except BaseException as error:
+        run_record.update(
+            {
+                "status": "failed",
+                "finished_at": _utc_now(),
+                "decoder_error": "{}: {}".format(
+                    type(error).__name__, error or "interrupted"
+                ),
+            }
+        )
+        try:
+            _atomic_write_json(run_path, run_record, overwrite=True)
+        except OSError:
+            pass
+        raise
+    finally:
+        display.stop()
     if return_code != 0:
         run_record.update(
             {
@@ -1687,6 +1897,44 @@ def get_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--overwrite", action="store_true")
     prepare.set_defaults(handler=prepare_manifest)
 
+    feature_prepare = subparsers.add_parser(
+        "prepare-features",
+        allow_abbrev=False,
+        help="Incrementally cache one CPU Fbank matrix per unique audio file.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    feature_prepare.add_argument("--manifest", type=Path, required=True)
+    feature_prepare.add_argument(
+        "--feature-cache-dir",
+        type=Path,
+        required=True,
+    )
+    feature_prepare.add_argument(
+        "--num-workers",
+        type=int,
+        default=max(1, min(8, os.cpu_count() or 1)),
+        help="CPU worker processes used for missing or stale entries.",
+    )
+    feature_prepare.add_argument(
+        "--force",
+        action="store_true",
+        help="Recompute valid entries instead of reusing them.",
+    )
+    feature_progress = feature_prepare.add_mutually_exclusive_group()
+    feature_progress.add_argument(
+        "--progress",
+        dest="progress",
+        action="store_true",
+        help="Show progress even when stderr is not a TTY.",
+    )
+    feature_progress.add_argument(
+        "--no-progress",
+        dest="progress",
+        action="store_false",
+        help="Disable the feature preparation progress display.",
+    )
+    feature_prepare.set_defaults(progress=None, handler=prepare_features)
+
     sweep = subparsers.add_parser(
         "sweep",
         allow_abbrev=False,
@@ -1721,6 +1969,20 @@ def get_parser() -> argparse.ArgumentParser:
         help="Reuse compatible completed inference and rebuild the report.",
     )
     existing.add_argument("--overwrite", action="store_true")
+    progress = sweep.add_mutually_exclusive_group()
+    progress.add_argument(
+        "--progress",
+        dest="progress",
+        action="store_true",
+        help="Show inference progress even when stderr is not a TTY.",
+    )
+    progress.add_argument(
+        "--no-progress",
+        dest="progress",
+        action="store_false",
+        help="Disable the inference progress display.",
+    )
+    sweep.set_defaults(progress=None)
     sweep.add_argument(
         "decoder_args",
         nargs=argparse.REMAINDER,

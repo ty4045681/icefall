@@ -4,6 +4,8 @@
     "keyword": "小美小美",
     "score": 1.0,
     "threshold": 0.35,
+    "max_token_gap_sec": 0.8,
+    "max_keyword_duration_sec": 2.0,
     "bpe_model": "data/lang_bpe_500/bpe.model",
     "model_args": {
       "causal": 1,

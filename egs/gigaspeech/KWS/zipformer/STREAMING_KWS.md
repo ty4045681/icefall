@@ -63,6 +63,8 @@ python3 egs/gigaspeech/KWS/zipformer/streaming_kws.py \
   --left-context-frames 64 \
   --keywords-score 1.5 \
   --keywords-threshold 0.35 \
+  --max-token-gap-sec 0.8 \
+  --max-keyword-duration-sec 2.0 \
   --pre-roll-sec 0.15 \
   --post-roll-sec 0.15
 ```
@@ -89,6 +91,8 @@ preserved. `detected_keyword` contains the readable text decoded from direct
 BPE input. A hit on a negative source row therefore remains `label=0`. Added
 audit columns include source path, raw and padded times, exact half-open sample
 indexes, score, token-frame timestamps, and the streaming operating point.
+When configured, `max_token_gap_sec` and `max_keyword_duration_sec` record the
+effective decoder time limits; an empty value means that limit was disabled.
 
 The current dma-kws two-stage evaluator assumes `keyword` is human-readable
 text when it runs Stage II G2P. Direct-BPE rows can be used by this Icefall
@@ -100,6 +104,45 @@ read/decode failure is logged and processing continues; the process returns
 status 2 after writing successful rows. Use `--fail-fast` to stop immediately
 instead. CSV schema errors (missing fields, empty keyword, or invalid label)
 always fail before inference so a malformed dataset is not processed partially.
+
+## 控制台进度
+
+批量 manifest 推理在交互式终端中会自动显示进度条，进度单位是
+`audio + keyword` trial，而不是 trial 数乘阈值数，因为所有阈值共享同一遍
+encoder。状态栏同时显示已导出的 clips、无命中的 threshold-trials 和错误数。
+`--progress` 可强制显示，`--no-progress` 可关闭；进度写入 stderr，不影响
+单 WAV 模式的 JSON stdout。优先使用可选的 Rich 渲染；环境未安装 Rich 时
+会自动退化为周期性纯文本，可按需运行 `python3 -m pip install rich`。
+
+## 关键词 token 时间约束
+
+RNN-T 的 blank 不会推进 ContextGraph。没有额外限制时，一个关键词前缀
+可以跨过很长的连续 blank，再与后面的 token 组成一次命中。流式脚本提供
+两个相互独立、只作用于 KWS 搜索状态的可选限制：
+
+- `--max-token-gap-sec`：当前关键词路径中，相邻非 blank token 发射时刻的
+  最大间隔。
+- `--max-keyword-duration-sec`：从第一个关键词 token 对应帧开始，到最后
+  一个 token 对应帧结束的最大总跨度，包含最后一帧。
+
+两项默认都关闭，以保持旧版本行为；也可以在 model config 中使用
+`max_token_gap_sec` 和 `max_keyword_duration_sec`。显式正数启用限制；命令行
+传 `0` 可覆盖 model config 并临时关闭对应限制，便于做 A/B 对照。
+当前模型的 KWS timestamp 每帧约为 `10 ms × 4 = 40 ms`，判断采用
+“超过才失效”，因此恰好等于边界仍然允许。关键词总时长至少需要覆盖
+一个 encoder 帧，即当前配置下不能小于 `0.04 s`。
+
+部分匹配过期时，decoder 会沿 ContextGraph 的 fail 链回退到最长仍满足
+时间限制的关键词前缀，撤回失效前缀的 context bonus，再处理当前帧；
+不会重置 Zipformer encoder/cache。已经完整匹配且通过声学阈值的关键词
+可以继续等待 `--num-tailing-blanks`，这段尾随 blank 不计入关键词内部
+时长；若超时后出现非 blank，则先回退搜索状态，再从该帧继续解码，避免
+把很晚的 token 接到已完成短词上。`--pre-roll-sec` 和 `--post-roll-sec`
+只控制导出 WAV，也不参与判断。
+
+`0.8 s` gap 和 `2.0 s` duration 可作为 “Hey Eva” 的初始实验值，但不应
+视为通用默认。建议在正样本上统计 token gap 和关键词时长，使用
+P99/P99.5 再加少量余量，然后同时观察 recall 与负样本 FA/h。
 
 ## 多阈值精确扫描
 
@@ -116,6 +159,8 @@ python3 egs/gigaspeech/KWS/zipformer/streaming_kws.py \
   --chunk-size 16 \
   --left-context-frames 64 \
   --keywords-score 1.5 \
+  --max-token-gap-sec 0.8 \
+  --max-keyword-duration-sec 2.0 \
   --keywords-thresholds "0.10,0.15 0.20,0.25"
 ```
 
@@ -140,8 +185,10 @@ reset 它自己的 decoder/context state，后续 beam 路径和命中时间已�
 
 ## 纯负样本阈值评估
 
-`negative_kws_eval.py` 将负样本准备、精确阈值扫描和报告分成
-`prepare` / `sweep` / `report` 三个子命令。
+`negative_kws_eval.py` 将负样本准备、可选的 Fbank 缓存、精确阈值
+扫描和报告分成 `prepare` / `prepare-features` / `sweep` /
+`report` 四个子命令。不使用特征缓存和多流 batch 时，原有行为
+保持不变。
 
 ### 1. 准备 MUSAN manifest
 
@@ -163,13 +210,44 @@ python3 egs/gigaspeech/KWS/zipformer/negative_kws_eval.py prepare \
 `--extensions` 接受空格或逗号分隔的后缀，但当前时长探测仅支持
 WAV/WAVE；MUSAN 使用默认 `wav` 即可。
 
-多个 keyword 会把同一音频展开为多个独立 trial；当前实现按行推理，
-因此 encoder 只在“同一 trial 的多个阈值”之间共享，不跨 keyword trial 共享。
+多个 keyword 会把同一音频展开为多个独立 trial。Fbank 缓存会按
+解析后的唯一音频路径去重，但每个 `audio + keyword` 仍是独立的
+encoder/decoder 流；encoder 输出只在“同一 trial 的多个阈值”之间
+共享，不跨 keyword trial 复用。
 
 输出 CSV 包含 `audio_path,keyword,label,category,source_duration_sec`。
 `audio_path` 默认相对于输出 manifest；`--absolute-paths` 可改为绝对路径。
 
-### 2. 扫描阈值
+### 2. 预计算 Fbank（可选）
+
+大批量重复评估时，可先为 manifest 中的每个唯一音频计算一份
+CPU Fbank：
+
+```bash
+python3 egs/gigaspeech/KWS/zipformer/negative_kws_eval.py prepare-features \
+  --manifest /work/kws_eval/musan_negative.csv \
+  --feature-cache-dir /work/kws_eval/fbank_cache \
+  --num-workers 8 \
+  --progress
+```
+
+该命令使用 CPU 进程并行，且默认是增量的：已存在且有效的条目直接
+复用，只计算缺失、过期或损坏的条目。源文件路径、大小或修改时间
+发生变化，或特征前端配置/依赖版本变化时，旧缓存会自动失效。
+`--force` 可强制重算所有条目。
+
+指定 `--feature-cache-dir` 后，`streaming_kws.py` 会在推理前对
+manifest 中所有唯一音频做严格缓存预检；任何条目缺失、过期或
+损坏都会终止本次推理，不会对单个文件静默回退到现场计算。
+这样可避免在扫描中混用不同特征路径。
+
+缓存使用 float32、80 维 Fbank，粗略需要每小时音频 115 MB
+磁盘空间（不含文件系统和元数据开销），大数据集应预留容量。
+缓存特征固定在 CPU 生成；与原来在 CUDA 上现场计算的特征可能存在
+极小浮点差异。对阈值边界敏感的对比实验，应全程使用同一种
+特征生成方式。
+
+### 3. 扫描阈值
 
 ```bash
 python3 egs/gigaspeech/KWS/zipformer/negative_kws_eval.py sweep \
@@ -178,15 +256,20 @@ python3 egs/gigaspeech/KWS/zipformer/negative_kws_eval.py sweep \
   --thresholds 0.10:0.50:0.05 \
   --category-field category \
   --duration-field source_duration_sec \
+  --progress \
   --overwrite \
   -- \
+  --feature-cache-dir /work/kws_eval/fbank_cache \
+  --stream-batch-size 8 \
   --checkpoint /path/to/epoch-30.pt \
   --bpe-model /path/to/bpe.model \
   --device cuda:0 \
   --causal 1 \
   --chunk-size 16 \
   --left-context-frames 64 \
-  --keywords-score 1.5
+  --keywords-score 1.5 \
+  --max-token-gap-sec 0.8 \
+  --max-keyword-duration-sec 2.0
 ```
 
 `--thresholds` 支持三种可混合的写法：空格列表、逗号列表，以及
@@ -198,6 +281,26 @@ python3 egs/gigaspeech/KWS/zipformer/negative_kws_eval.py sweep \
 `--decode-script` 可替换默认的同目录脚本，`--python` 可选择解释器。
 manifest 路径、输出路径、阈值、`--fail-fast` 和 `--overwrite` 由 sweep
 管理，不能在透传参数中重复指定。
+
+`--feature-cache-dir` 和 `--stream-batch-size` 都是
+`streaming_kws.py` 参数，因此在 `sweep` 命令中必须放在 `--` 之后。
+batch 模式每次把最多 N 条彼此独立的音频流合成一次 Zipformer
+streaming encoder 前向；某条流完成后会立即用下一个 trial 补位，
+因此可处理时长不同的音频，同时保持各流的 encoder cache、搜索状态和
+多阈值 decoder 完全独立。
+
+`--stream-batch-size > 1` 仅支持 causal streaming 模式，并且必须同时
+提供完整的 `--feature-cache-dir` 和 `--fail-fast`；`sweep` 已自动添加
+`--fail-fast`，直接调用 `streaming_kws.py` 时则需显式添加。建议从
+`4` / `8` / `16` 中选择起点，根据 GPU 显存和实测吞吐调整；更大不一定
+更快。省略这两个参数时，仍使用原有的“逐 trial 读 WAV、现场计算特征、
+batch size 1”路径；
+只指定特征缓存而保持 batch size 1 也是支持的。
+
+进度选项属于 `sweep` 本身，必须放在 `--` 之前。父进程从 decoder 的结构化
+进度事件更新终端，同时继续把普通 stdout/stderr 原子写入 `runner.log`；因此
+不会把 Rich 控制字符写进日志。`--resume` 复用完成的 inference，不重复跑
+进度条，且切换 `--progress` / `--no-progress` 不影响运行指纹。
 
 sweep 强制启用 `--fail-fast`：任一源音频失败都会使本次 inference
 失败，`run.json` 记录 `failed` 状态，详情见 `runner.log`。这样不会把
@@ -215,7 +318,7 @@ script 及参数指纹完全一致，且 inference 已成功完成时，复用�
 指定；若明确不做分类，可传 `--category-field ''`，所有行将归入
 `uncategorized`。缺少指定的时长字段时会直接探测 WAV 时长。
 
-### 3. 产物和指标
+### 4. 产物和指标
 
 `sweep` 成功后目录如下：
 

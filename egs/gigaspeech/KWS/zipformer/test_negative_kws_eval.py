@@ -12,6 +12,7 @@ import unittest
 import wave
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).with_name("negative_kws_eval.py")
 SPEC = importlib.util.spec_from_file_location("negative_kws_eval", SCRIPT)
@@ -87,7 +88,14 @@ class TestThresholdParsing(unittest.TestCase):
                     MODULE.parse_thresholds(values)
 
     def test_sweep_owned_options_reject_child_abbreviations(self):
-        for value in ("--man", "--output-m", "--overw", "--keywords-t"):
+        for value in (
+            "--man",
+            "--output-m",
+            "--overw",
+            "--keywords-t",
+            "--progress",
+            "--no-progress",
+        ):
             with self.subTest(value=value):
                 with self.assertRaises(MODULE.EvaluationError):
                     MODULE._validate_decoder_args([value, "ignored"])
@@ -95,6 +103,269 @@ class TestThresholdParsing(unittest.TestCase):
             MODULE._validate_decoder_args(["--model-config", "model.json"]),
             ["--model-config", "model.json"],
         )
+
+
+class TestProgress(unittest.TestCase):
+    def test_sweep_progress_flags_are_tristate(self):
+        parser = MODULE.get_parser()
+        base = [
+            "sweep",
+            "--manifest",
+            "manifest.csv",
+            "--output-dir",
+            "output",
+            "--thresholds",
+            "0.2",
+        ]
+
+        self.assertIsNone(parser.parse_args(base).progress)
+        self.assertTrue(parser.parse_args(base + ["--progress"]).progress)
+        self.assertFalse(parser.parse_args(base + ["--no-progress"]).progress)
+
+    def test_progress_event_parser_rejects_invalid_payloads(self):
+        prefix = MODULE.PROGRESS_EVENT_PREFIX
+        progress_module = sys.modules[MODULE.parse_progress_event.__module__]
+        emitted = io.StringIO()
+        progress_module.emit_progress_event(
+            completed=2,
+            total=3,
+            stream=emitted,
+            clips=4,
+        )
+        self.assertEqual(
+            MODULE.parse_progress_event(emitted.getvalue()),
+            {"completed": 2, "total": 3, "clips": 4},
+        )
+        for line in (
+            "ordinary output\n",
+            prefix + "not-json\n",
+            prefix + '{"completed":-1,"total":3}\n',
+            prefix + '{"completed":4,"total":3}\n',
+            prefix + '{"completed":1.5,"total":3}\n',
+            prefix + '{"completed":true,"total":3}\n',
+        ):
+            with self.subTest(line=line):
+                self.assertIsNone(MODULE.parse_progress_event(line))
+
+    def test_run_decoder_extracts_events_and_preserves_normal_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child = root / "child.py"
+            child.write_text(
+                "import os, sys\n"
+                "print('stdout line', flush=True)\n"
+                "print('stderr line', file=sys.stderr, flush=True)\n"
+                "print('__ICEFALL_KWS_PROGRESS__='\n"
+                "      '{\"completed\":1,\"total\":2,\"clips\":3}', flush=True)\n"
+                "print('__ICEFALL_KWS_PROGRESS__=bad-json', flush=True)\n"
+                "assert os.environ.get('ICEFALL_KWS_PROGRESS_EVENTS') == '1'\n",
+                encoding="utf-8",
+            )
+            log_path = root / "runner.log"
+            events = []
+
+            return_code = MODULE._run_decoder(
+                [sys.executable, str(child)],
+                log_path,
+                on_progress=events.append,
+            )
+
+            self.assertEqual(return_code, 0)
+            self.assertEqual(events, [{"completed": 1, "total": 2, "clips": 3}])
+            log = log_path.read_text(encoding="utf-8")
+            self.assertIn("stdout line", log)
+            self.assertIn("stderr line", log)
+            self.assertIn("bad-json", log)
+            self.assertNotIn('"completed":1', log)
+
+    def test_progress_callback_failure_does_not_stop_decoder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child = root / "child.py"
+            child.write_text(
+                "print('__ICEFALL_KWS_PROGRESS__='\n"
+                "      '{\"completed\":1,\"total\":1}', flush=True)\n"
+                "print('decoder finished', flush=True)\n",
+                encoding="utf-8",
+            )
+            log_path = root / "runner.log"
+
+            def broken_callback(event):
+                del event
+                raise RuntimeError("display failed")
+
+            return_code = MODULE._run_decoder(
+                [sys.executable, str(child)],
+                log_path,
+                on_progress=broken_callback,
+            )
+
+            self.assertEqual(return_code, 0)
+            log = log_path.read_text(encoding="utf-8")
+            self.assertIn("progress display disabled", log)
+            self.assertIn("decoder finished", log)
+
+    def test_run_decoder_terminates_child_when_progress_stream_fails(self):
+        class BrokenStdout:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return None
+
+            def __iter__(self):
+                raise KeyboardInterrupt
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdout = BrokenStdout()
+                self.terminated = False
+                self.waited = False
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout=None):
+                self.waited = True
+                return -15
+
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "runner.log"
+            process = FakeProcess()
+            with mock.patch.object(
+                MODULE.subprocess, "Popen", return_value=process
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    MODULE._run_decoder(
+                        [sys.executable, "decoder.py"],
+                        log_path,
+                        on_progress=lambda event: None,
+                    )
+
+            self.assertTrue(process.terminated)
+            self.assertTrue(process.waited)
+            self.assertFalse(log_path.exists())
+
+    def test_no_progress_clears_private_event_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child = root / "child.py"
+            child.write_text(
+                "import os\n"
+                "assert 'ICEFALL_KWS_PROGRESS_EVENTS' not in os.environ\n"
+                "print('clean environment')\n",
+                encoding="utf-8",
+            )
+            log_path = root / "runner.log"
+            with mock.patch.dict(
+                MODULE.os.environ,
+                {MODULE.PROGRESS_EVENT_ENV: "1"},
+                clear=False,
+            ):
+                return_code = MODULE._run_decoder(
+                    [sys.executable, str(child)], log_path
+                )
+
+            self.assertEqual(return_code, 0)
+            self.assertIn(
+                "clean environment", log_path.read_text(encoding="utf-8")
+            )
+
+    def test_console_progress_auto_disable_and_plain_fallback(self):
+        disabled_stream = io.StringIO()
+        display = MODULE.ConsoleProgress(
+            total=2,
+            description="Hidden",
+            enabled=None,
+            stream=disabled_stream,
+        )
+        list(display.track(range(2)))
+        display.complete()
+        self.assertEqual(disabled_stream.getvalue(), "")
+
+        real_import = __import__
+
+        def without_rich(name, *args, **kwargs):
+            if name == "rich" or name.startswith("rich."):
+                raise ImportError("rich unavailable")
+            return real_import(name, *args, **kwargs)
+
+        fallback_stream = io.StringIO()
+        with mock.patch("builtins.__import__", side_effect=without_rich):
+            display = MODULE.ConsoleProgress(
+                total=2,
+                description="Fallback",
+                enabled=True,
+                stream=fallback_stream,
+                unit="trials",
+            )
+            display.start()
+            display.update(completed=1, status="clips=0")
+            display.complete(status="done")
+            display.stop()
+
+        output = fallback_stream.getvalue()
+        self.assertIn("Fallback", output)
+        self.assertIn("2/2 trials", output)
+        self.assertIn("done", output)
+
+    def test_console_progress_output_failures_are_nonfatal(self):
+        class BrokenStream:
+            def isatty(self):
+                return False
+
+            def write(self, value):
+                del value
+                raise RuntimeError("stream unavailable")
+
+            def flush(self):
+                raise RuntimeError("stream unavailable")
+
+        real_import = __import__
+
+        def without_rich(name, *args, **kwargs):
+            if name == "rich" or name.startswith("rich."):
+                raise ImportError("rich unavailable")
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=without_rich):
+            display = MODULE.ConsoleProgress(
+                total=1,
+                description="Broken",
+                enabled=True,
+                stream=BrokenStream(),
+            )
+            display.start()
+            display.complete(status="done")
+            display.stop()
+
+        self.assertFalse(display.enabled)
+
+    def test_console_progress_stops_when_tracked_loop_raises(self):
+        class SpyProgress(MODULE.ConsoleProgress):
+            def __init__(self):
+                super().__init__(
+                    total=2,
+                    description="Spy",
+                    enabled=False,
+                    stream=io.StringIO(),
+                )
+                self.stop_count = 0
+
+            def stop(self):
+                self.stop_count += 1
+                super().stop()
+
+        display = SpyProgress()
+
+        with self.assertRaisesRegex(RuntimeError, "stop now"):
+            for _ in display.track(range(2)):
+                raise RuntimeError("stop now")
+
+        self.assertEqual(display.stop_count, 1)
 
 
 class TestPrepare(unittest.TestCase):
@@ -154,6 +425,66 @@ class TestPrepare(unittest.TestCase):
             self.assertEqual(
                 {row["category"] for row in exposure}, {MODULE.UNCATEGORIZED}
             )
+
+    def test_prepare_features_deduplicates_resolved_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = root / "audio.wav"
+            audio.write_bytes(b"placeholder")
+            manifest = root / "manifest.csv"
+            write_csv(
+                manifest,
+                ("audio_path", "keyword", "label"),
+                [
+                    {"audio_path": audio.name, "keyword": "ONE", "label": 0},
+                    {"audio_path": audio.name, "keyword": "TWO", "label": 0},
+                ],
+            )
+            cache_dir = root / "features"
+            with mock.patch.object(
+                MODULE,
+                "prepare_cached_fbank",
+                return_value={"status": "computed"},
+            ) as prepare_one:
+                return_code, stdout, stderr = quiet_main(
+                    [
+                        "prepare-features",
+                        "--manifest",
+                        str(manifest),
+                        "--feature-cache-dir",
+                        str(cache_dir),
+                        "--num-workers",
+                        "1",
+                        "--no-progress",
+                    ]
+                )
+
+            self.assertEqual(return_code, 0, stderr)
+            self.assertIn("1 unique files", stdout)
+            prepare_one.assert_called_once_with(
+                str(audio.resolve()), str(cache_dir), False
+            )
+
+    def test_prepare_features_rejects_nonpositive_worker_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "manifest.csv"
+            write_csv(manifest, ("audio_path", "keyword"), [])
+
+            return_code, _, stderr = quiet_main(
+                [
+                    "prepare-features",
+                    "--manifest",
+                    str(manifest),
+                    "--feature-cache-dir",
+                    str(root / "features"),
+                    "--num-workers",
+                    "0",
+                ]
+            )
+
+            self.assertEqual(return_code, 2)
+            self.assertIn("--num-workers must be positive", stderr)
 
 
 class TestOutputSafety(unittest.TestCase):
@@ -367,8 +698,10 @@ with output.open("w", encoding="utf-8", newline="") as handle:
             argv_log = root / "argv.json"
             checkpoint = root / "model.pt"
             bpe_model = root / "bpe.model"
+            feature_cache = root / "features"
             checkpoint.write_bytes(b"model")
             bpe_model.write_bytes(b"bpe")
+            feature_cache.mkdir()
 
             def sweep_args(existing_flag=None):
                 values = [
@@ -397,6 +730,14 @@ with output.open("w", encoding="utf-8", newline="") as handle:
                         str(checkpoint),
                         "--bpe-model",
                         str(bpe_model),
+                        "--max-token-gap-sec",
+                        "0.8",
+                        "--max-keyword-duration-sec",
+                        "2.0",
+                        "--feature-cache-dir",
+                        str(feature_cache),
+                        "--stream-batch-size",
+                        "8",
                     ]
                 )
                 return values
@@ -407,6 +748,14 @@ with output.open("w", encoding="utf-8", newline="") as handle:
             decoder_argv = json.loads(argv_log.read_text(encoding="utf-8"))
             threshold_index = decoder_argv.index("--keywords-thresholds")
             self.assertEqual(decoder_argv[threshold_index + 1], "0.2,0.4")
+            gap_index = decoder_argv.index("--max-token-gap-sec")
+            self.assertEqual(decoder_argv[gap_index + 1], "0.8")
+            duration_index = decoder_argv.index("--max-keyword-duration-sec")
+            self.assertEqual(decoder_argv[duration_index + 1], "2.0")
+            cache_index = decoder_argv.index("--feature-cache-dir")
+            self.assertEqual(decoder_argv[cache_index + 1], str(feature_cache))
+            batch_index = decoder_argv.index("--stream-batch-size")
+            self.assertEqual(decoder_argv[batch_index + 1], "8")
             event_rows = read_csv(output_dir / "inference" / "manifest.csv")
             self.assertEqual(
                 {row["keywords_threshold"] for row in event_rows}, {"0.2", "0.4"}
@@ -415,7 +764,9 @@ with output.open("w", encoding="utf-8", newline="") as handle:
             self.assertEqual(run["status"], "complete")
             self.assertEqual(run["decoder_return_code"], 0)
 
-            return_code, _, stderr = quiet_main(sweep_args("--resume"))
+            resume_args = sweep_args("--resume")
+            resume_args.insert(resume_args.index("--"), "--no-progress")
+            return_code, _, stderr = quiet_main(resume_args)
             self.assertEqual(return_code, 0, stderr)
             self.assertEqual(counter.read_text(encoding="utf-8"), "1")
 

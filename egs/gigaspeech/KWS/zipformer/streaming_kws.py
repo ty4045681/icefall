@@ -56,20 +56,51 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import AbstractSet, Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    AbstractSet,
+    Any,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 # Unlike run.sh, dma-kws launches this file directly and does not inject the
 # icefall repository into PYTHONPATH.
 ZIPFORMER_RECIPE_DIR = Path(__file__).resolve().parent
 KWS_RECIPE_DIR = ZIPFORMER_RECIPE_DIR.parent
 ICEFALL_ROOT = Path(__file__).resolve().parents[4]
+if str(ZIPFORMER_RECIPE_DIR) not in sys.path:
+    sys.path.insert(0, str(ZIPFORMER_RECIPE_DIR))
 if str(ICEFALL_ROOT) not in sys.path:
     sys.path.insert(0, str(ICEFALL_ROOT))
 
+from kws_feature_cache import (  # noqa: E402
+    FbankFeatureCache,
+    SAMPLE_RATE,
+    compute_fbank,
+    load_audio,
+)
+from kws_progress import (  # noqa: E402
+    ConsoleProgress,
+    emit_progress_event,
+    progress_events_requested,
+)
+from kws_streaming_batch import (  # noqa: E402
+    stack_states,
+    unstack_states,
+)
+
 LOG_EPS = math.log(1e-10)
-SAMPLE_RATE = 16000
 FBANK_FRAME_SHIFT_MS = 10.0
 ENCODER_SUBSAMPLING_FACTOR = 4
+ENCODER_FRAME_SHIFT_SEC = (
+    FBANK_FRAME_SHIFT_MS * ENCODER_SUBSAMPLING_FACTOR / 1000.0
+)
 
 # Conv2dSubsampling consumes 7 frames and its ConvNeXt block needs three
 # right-context frames at the 50-Hz rate.  This matches streaming_decode.py.
@@ -121,6 +152,8 @@ GENERATED_MANIFEST_FIELDS = (
     "chunk_size",
     "left_context_frames",
     "keywords_threshold",
+    "max_token_gap_sec",
+    "max_keyword_duration_sec",
 )
 
 
@@ -163,6 +196,10 @@ def parse_keywords_thresholds(value: str) -> List[float]:
 
 
 def _format_threshold(value: float) -> str:
+    return _format_compact_float(value)
+
+
+def _format_compact_float(value: float) -> str:
     return format(float(value), ".12g")
 
 
@@ -257,6 +294,27 @@ def get_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--num-tailing-blanks", type=int, default=1)
+    parser.add_argument(
+        "--max-token-gap-sec",
+        type=float,
+        default=None,
+        help=(
+            "Maximum emission-time gap between adjacent non-blank keyword "
+            "tokens. Omitted uses model-config key max_token_gap_sec; zero "
+            "explicitly disables the limit."
+        ),
+    )
+    parser.add_argument(
+        "--max-keyword-duration-sec",
+        type=float,
+        default=None,
+        help=(
+            "Maximum inclusive time span from the first to last keyword token. "
+            "Positive values must cover at least one 0.04-second encoder frame. "
+            "Omitted uses model-config key max_keyword_duration_sec; zero "
+            "explicitly disables the limit."
+        ),
+    )
     parser.add_argument("--blank-penalty", type=float, default=0.0)
     parser.add_argument(
         "--tail-padding-sec",
@@ -293,6 +351,25 @@ def get_parser() -> argparse.ArgumentParser:
         help="Audio retained after the last detected token in manifest mode.",
     )
     parser.add_argument(
+        "--feature-cache-dir",
+        type=Path,
+        help=(
+            "Read CPU Fbank features prepared by negative_kws_eval.py "
+            "prepare-features. Manifest mode only; every unique audio file "
+            "must have a valid cache entry."
+        ),
+    )
+    parser.add_argument(
+        "--stream-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of independent audio streams advanced in one streaming "
+            "encoder batch. Values above one require --feature-cache-dir "
+            "and --fail-fast."
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Allow replacing generated WAVs and the output manifest.",
@@ -305,6 +382,20 @@ def get_parser() -> argparse.ArgumentParser:
             "partial results. CSV schema errors always fail before inference."
         ),
     )
+    progress = parser.add_mutually_exclusive_group()
+    progress.add_argument(
+        "--progress",
+        dest="progress",
+        action="store_true",
+        help="Show manifest inference progress even when stderr is not a TTY.",
+    )
+    progress.add_argument(
+        "--no-progress",
+        dest="progress",
+        action="store_false",
+        help="Disable the manifest inference progress display.",
+    )
+    parser.set_defaults(progress=None)
     return parser
 
 
@@ -321,6 +412,15 @@ class Detection:
     @property
     def end_frame(self) -> int:
         return max(self.timestamp_frames)
+
+
+@dataclass
+class KeywordBatchItem:
+    """One independent feature stream for batched encoder inference."""
+
+    item_id: Any
+    features: Any
+    keywords_graphs: Mapping[float, Any]
 
 
 @dataclass
@@ -358,6 +458,67 @@ class ClipBounds:
         return self.end_sample / self.sample_rate
 
 
+@dataclass(frozen=True)
+class KeywordTimingPolicy:
+    """Optional decoder-side time limits for one keyword token path."""
+
+    max_token_gap_sec: Optional[float] = None
+    max_keyword_duration_sec: Optional[float] = None
+    frame_shift_sec: float = ENCODER_FRAME_SHIFT_SEC
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("max_token_gap_sec", self.max_token_gap_sec),
+            ("max_keyword_duration_sec", self.max_keyword_duration_sec),
+            ("frame_shift_sec", self.frame_shift_sec),
+        ):
+            if value is not None and (not math.isfinite(value) or value <= 0):
+                raise ValueError("{} must be a finite positive value".format(name))
+        if (
+            self.max_keyword_duration_sec is not None
+            and self.max_keyword_duration_sec + 1.0e-9 < self.frame_shift_sec
+        ):
+            raise ValueError(
+                "max_keyword_duration_sec must cover at least one encoder "
+                "frame ({:.3f} seconds)".format(self.frame_shift_sec)
+            )
+
+    @property
+    def enabled(self) -> bool:
+        return (
+            self.max_token_gap_sec is not None
+            or self.max_keyword_duration_sec is not None
+        )
+
+    @staticmethod
+    def _exceeds(value: float, limit: Optional[float]) -> bool:
+        return limit is not None and value > limit + 1.0e-9
+
+    def can_continue(self, timestamps: Sequence[int], current_frame: int) -> bool:
+        """Return whether a partial path may emit its next token now."""
+        if not timestamps:
+            return True
+        gap_sec = (current_frame - timestamps[-1]) * self.frame_shift_sec
+        duration_sec = (current_frame - timestamps[0] + 1) * self.frame_shift_sec
+        return not self._exceeds(
+            gap_sec, self.max_token_gap_sec
+        ) and not self._exceeds(duration_sec, self.max_keyword_duration_sec)
+
+    def accepts(self, timestamps: Sequence[int]) -> bool:
+        """Return whether a completed keyword satisfies both time limits."""
+        if not timestamps:
+            return False
+        if self.max_token_gap_sec is not None:
+            for previous, current in zip(timestamps, timestamps[1:]):
+                if self._exceeds(
+                    (current - previous) * self.frame_shift_sec,
+                    self.max_token_gap_sec,
+                ):
+                    return False
+        duration_sec = (timestamps[-1] - timestamps[0] + 1) * self.frame_shift_sec
+        return not self._exceeds(duration_sec, self.max_keyword_duration_sec)
+
+
 @dataclass
 class _DecoderHypothesis:
     ys: List[int]
@@ -366,15 +527,59 @@ class _DecoderHypothesis:
     timestamp: List[int] = field(default_factory=list)
     ac_probs: List[float] = field(default_factory=list)
     num_tailing_blanks: int = 0
+    use_timing_key: bool = False
+    score_length: Optional[int] = None
 
     @property
-    def key(self) -> str:
-        return "_".join(str(token) for token in self.ys)
+    def effective_score_length(self) -> int:
+        if self.score_length is None:
+            return max(1, len(self.ys))
+        return max(1, self.score_length)
+
+    @property
+    def key(self) -> Any:
+        tokens = tuple(self.ys)
+        if not self.use_timing_key:
+            return tokens
+        level = int(getattr(self.context_state, "level", 0))
+        context_timestamps = tuple(self.timestamp[-level:]) if level > 0 else ()
+        state_id = getattr(self.context_state, "id", id(self.context_state))
+        return tokens, state_id, context_timestamps, self.effective_score_length
+
+
+@dataclass
+class _ExpansionGroup:
+    hypothesis: _DecoderHypothesis
+    blank_log_prob: Optional[Any] = None
+    nonblank_log_prob: Optional[Any] = None
+
+    @staticmethod
+    def _merge(left: Optional[Any], right: Any) -> Any:
+        if left is None:
+            return right
+        import torch
+
+        return torch.logaddexp(left, right)
+
+    def add(
+        self,
+        hypothesis: _DecoderHypothesis,
+        allow_blank_like: bool,
+        allow_nonblank: bool,
+    ) -> None:
+        if allow_blank_like:
+            self.blank_log_prob = self._merge(
+                self.blank_log_prob, hypothesis.log_prob
+            )
+        if allow_nonblank:
+            self.nonblank_log_prob = self._merge(
+                self.nonblank_log_prob, hypothesis.log_prob
+            )
 
 
 class _HypothesisList:
     def __init__(self) -> None:
-        self.data: Dict[str, _DecoderHypothesis] = {}
+        self.data: Dict[Any, _DecoderHypothesis] = {}
 
     def add(self, hyp: _DecoderHypothesis) -> None:
         import torch
@@ -391,8 +596,12 @@ class _HypothesisList:
     def most_probable(self) -> _DecoderHypothesis:
         return max(
             self.data.values(),
-            key=lambda hyp: float(hyp.log_prob) / max(1, len(hyp.ys)),
+            key=_hypothesis_rank,
         )
+
+
+def _hypothesis_rank(hyp: _DecoderHypothesis) -> float:
+    return float(hyp.log_prob) / hyp.effective_score_length
 
 
 def _single_deployment_value(value: Any, default: int, name: str) -> int:
@@ -793,6 +1002,33 @@ class LoadedRuntime:
     keywords_score: float
     keywords_threshold: float
     config: Dict[str, Any]
+    max_token_gap_sec: Optional[float] = None
+    max_keyword_duration_sec: Optional[float] = None
+
+
+def _resolve_optional_positive_seconds(
+    cli_value: Optional[float],
+    config: Mapping[str, Any],
+    config_key: str,
+    option_name: str,
+) -> Optional[float]:
+    """Resolve a positive limit, treating an explicit zero as disabled."""
+    raw_value = cli_value if cli_value is not None else config.get(config_key)
+    if raw_value is None or str(raw_value).strip() == "":
+        return None
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("{} must be a number".format(option_name)) from error
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(
+            "{} must be finite and non-negative (zero disables it)".format(
+                option_name
+            )
+        )
+    if value == 0:
+        return None
+    return value
 
 
 def _torch_load(path: Path, device: Any) -> Any:
@@ -899,6 +1135,22 @@ def load_runtime(args: argparse.Namespace) -> LoadedRuntime:
     from train import get_model, get_params
 
     config = _load_json_config(args.model_config)
+    max_token_gap_sec = _resolve_optional_positive_seconds(
+        getattr(args, "max_token_gap_sec", None),
+        config,
+        "max_token_gap_sec",
+        "--max-token-gap-sec",
+    )
+    max_keyword_duration_sec = _resolve_optional_positive_seconds(
+        getattr(args, "max_keyword_duration_sec", None),
+        config,
+        "max_keyword_duration_sec",
+        "--max-keyword-duration-sec",
+    )
+    KeywordTimingPolicy(
+        max_token_gap_sec=max_token_gap_sec,
+        max_keyword_duration_sec=max_keyword_duration_sec,
+    )
     config_base = (
         args.model_config.expanduser().resolve().parent
         if args.model_config is not None
@@ -978,11 +1230,14 @@ def load_runtime(args: argparse.Namespace) -> LoadedRuntime:
         raise ValueError("--tail-padding-sec must be non-negative")
 
     logging.info(
-        "Loaded %s (%s, chunk=%s, left-context=%s, parameters=%s)",
+        "Loaded %s (%s, chunk=%s, left-context=%s, max-token-gap=%s, "
+        "max-keyword-duration=%s, parameters=%s)",
         checkpoint_path,
         decode_mode,
         params.chunk_size,
         params.left_context_frames,
+        max_token_gap_sec,
+        max_keyword_duration_sec,
         sum(parameter.numel() for parameter in model.parameters()),
     )
     return LoadedRuntime(
@@ -994,6 +1249,8 @@ def load_runtime(args: argparse.Namespace) -> LoadedRuntime:
         keywords_score=keywords_score,
         keywords_threshold=keywords_threshold,
         config=config,
+        max_token_gap_sec=max_token_gap_sec,
+        max_keyword_duration_sec=max_keyword_duration_sec,
     )
 
 
@@ -1300,6 +1557,8 @@ class StatefulKeywordDecoder:
         beam: int,
         num_tailing_blanks: int,
         blank_penalty: float,
+        max_token_gap_sec: Optional[float] = None,
+        max_keyword_duration_sec: Optional[float] = None,
     ) -> None:
         import torch
 
@@ -1313,21 +1572,158 @@ class StatefulKeywordDecoder:
         self.context_size = model.decoder.context_size
         self.device = next(model.parameters()).device
         self.torch = torch
+        self.timing_policy = KeywordTimingPolicy(
+            max_token_gap_sec=max_token_gap_sec,
+            max_keyword_duration_sec=max_keyword_duration_sec,
+        )
         self.frame_offset = 0
         self.hypotheses = _HypothesisList()
         self._reset_hypotheses()
+
+    def _initial_decoder_history(self) -> List[int]:
+        return [-1] * (self.context_size - 1) + [self.blank_id]
 
     def _reset_hypotheses(self) -> None:
         self.hypotheses = _HypothesisList()
         self.hypotheses.add(
             _DecoderHypothesis(
-                ys=[-1] * (self.context_size - 1) + [self.blank_id],
+                ys=self._initial_decoder_history(),
                 log_prob=self.torch.tensor(
                     0.0, dtype=self.torch.float32, device=self.device
                 ),
                 context_state=self.keywords_graph.root,
+                use_timing_key=self.timing_policy.enabled,
+                score_length=self.context_size,
             )
         )
+
+    @staticmethod
+    def _state_level(state: Any) -> int:
+        return max(0, int(getattr(state, "level", 0)))
+
+    def _state_timestamps(
+        self, hyp: _DecoderHypothesis, state: Optional[Any] = None
+    ) -> List[int]:
+        state = hyp.context_state if state is None else state
+        level = self._state_level(state)
+        if level == 0:
+            return []
+        if len(hyp.timestamp) < level:
+            return []
+        return hyp.timestamp[-level:]
+
+    def _state_is_valid_at(
+        self, hyp: _DecoderHypothesis, state: Any, absolute_t: int
+    ) -> bool:
+        level = self._state_level(state)
+        if level == 0:
+            return True
+        timestamps = self._state_timestamps(hyp, state)
+        return (
+            len(timestamps) == level
+            and self.timing_policy.accepts(timestamps)
+            and self.timing_policy.can_continue(timestamps, absolute_t)
+        )
+
+    def _fallback_state(self, hyp: _DecoderHypothesis, absolute_t: int) -> Any:
+        """Find the longest still-valid context suffix for this frame."""
+        state = hyp.context_state
+        visited = set()
+        while state is not self.keywords_graph.root and not self._state_is_valid_at(
+            hyp, state, absolute_t
+        ):
+            identity = id(state)
+            if identity in visited:
+                return self.keywords_graph.root
+            visited.add(identity)
+            state = getattr(state, "fail", None) or self.keywords_graph.root
+        return state
+
+    def _normalize_hypothesis_time(
+        self, hyp: _DecoderHypothesis, absolute_t: int
+    ) -> _DecoderHypothesis:
+        if not self.timing_policy.enabled:
+            return hyp
+
+        old_state = hyp.context_state
+        new_state = self._fallback_state(hyp, absolute_t)
+        if new_state is old_state:
+            return hyp
+
+        old_score = float(getattr(old_state, "node_score", 0.0))
+        new_score = float(getattr(new_state, "node_score", 0.0))
+        new_level = self._state_level(new_state)
+        timestamps = hyp.timestamp[-new_level:] if new_level else []
+        ac_probs = hyp.ac_probs[-new_level:] if new_level else []
+        ys = hyp.ys[:]
+        tailing_blanks = hyp.num_tailing_blanks
+        if new_state is self.keywords_graph.root:
+            # All history before a root reset is irrelevant to both the
+            # predictor and ContextGraph. Canonicalizing it also lets
+            # equivalent root paths merge instead of consuming the beam.
+            ys = self._initial_decoder_history()
+            tailing_blanks = 0
+        return _DecoderHypothesis(
+            ys=ys,
+            log_prob=hyp.log_prob + new_score - old_score,
+            context_state=new_state,
+            timestamp=timestamps,
+            ac_probs=ac_probs,
+            num_tailing_blanks=tailing_blanks,
+            use_timing_key=True,
+            score_length=hyp.effective_score_length,
+        )
+
+    def _expansion_groups(self, absolute_t: int) -> List[_ExpansionGroup]:
+        """Merge equivalent blank/nonblank bases before global top-k."""
+        variants: List[Tuple[_DecoderHypothesis, bool, bool]] = []
+        for hyp in self.hypotheses.values():
+            normalized = self._normalize_hypothesis_time(hyp, absolute_t)
+            if normalized is hyp:
+                variants.append((hyp, True, True))
+                continue
+
+            # A completed keyword may wait beyond its continuation timeout for
+            # tail blanks. It must not, however, extend a stale ContextGraph
+            # prefix with a later non-blank token. Keep the pending match only
+            # for blank/unk; recompute non-blank logits from the valid suffix.
+            if self._matched_detection(hyp) is not None:
+                variants.append((hyp, True, False))
+                variants.append((normalized, False, True))
+            else:
+                variants.append((normalized, True, True))
+
+        groups: Dict[Any, _ExpansionGroup] = {}
+        for hyp, allow_blank_like, allow_nonblank in variants:
+            group = groups.get(hyp.key)
+            if group is None:
+                group = _ExpansionGroup(hypothesis=hyp)
+                groups[hyp.key] = group
+            group.add(hyp, allow_blank_like, allow_nonblank)
+        return list(groups.values())
+
+    def _most_probable_detection_candidate(
+        self,
+    ) -> Optional[_DecoderHypothesis]:
+        """Preserve top-path semantics while ignoring invalid alignments."""
+        hypotheses = sorted(
+            self.hypotheses.values(), key=_hypothesis_rank, reverse=True
+        )
+        for hyp in hypotheses:
+            matched, matched_state = self.keywords_graph.is_matched(
+                hyp.context_state
+            )
+            if self.timing_policy.enabled and matched and matched_state is not None:
+                level = self._state_level(matched_state)
+                timestamps = hyp.timestamp[-level:] if level > 0 else []
+                if (
+                    level <= 0
+                    or len(timestamps) != level
+                    or not self.timing_policy.accepts(timestamps)
+                ):
+                    continue
+            return hyp
+        return None
 
     def _matched_detection(self, hyp: _DecoderHypothesis) -> Optional[Detection]:
         matched, matched_state = self.keywords_graph.is_matched(hyp.context_state)
@@ -1335,6 +1731,9 @@ class StatefulKeywordDecoder:
             return None
         level = int(matched_state.level)
         if level <= 0 or len(hyp.ac_probs) < level or len(hyp.timestamp) < level:
+            return None
+        timestamps = hyp.timestamp[-level:]
+        if not self.timing_policy.accepts(timestamps):
             return None
         score = sum(hyp.ac_probs[-level:]) / level
         if score < float(matched_state.ac_threshold):
@@ -1363,7 +1762,12 @@ class StatefulKeywordDecoder:
 
         for local_t in range(projected.size(1)):
             absolute_t = self.frame_offset + local_t
-            active = self.hypotheses.values()
+            groups: Optional[List[_ExpansionGroup]] = None
+            if self.timing_policy.enabled:
+                groups = self._expansion_groups(absolute_t)
+                active = [group.hypothesis for group in groups]
+            else:
+                active = self.hypotheses.values()
             if not active:
                 raise RuntimeError("keyword beam unexpectedly became empty")
 
@@ -1386,15 +1790,49 @@ class StatefulKeywordDecoder:
 
             probs = logits.softmax(dim=-1)
             log_probs = logits.log_softmax(dim=-1)
-            previous = torch.stack([hyp.log_prob for hyp in active]).reshape(-1, 1)
-            combined = log_probs + previous
-            vocab_size = combined.size(1)
+            vocab_size = log_probs.size(1)
+            if groups is None:
+                previous = torch.stack(
+                    [hyp.log_prob for hyp in active]
+                ).reshape(-1, 1)
+                combined = log_probs + previous
+            else:
+                blank_like_ids = sorted(
+                    {
+                        token
+                        for token in (self.blank_id, self.unk_id)
+                        if 0 <= token < vocab_size
+                    }
+                )
+                negative_inf = log_probs.new_full((), -float("inf"))
+                blank_base = torch.stack(
+                    [
+                        negative_inf
+                        if group.blank_log_prob is None
+                        else group.blank_log_prob
+                        for group in groups
+                    ]
+                )
+                nonblank_base = torch.stack(
+                    [
+                        negative_inf
+                        if group.nonblank_log_prob is None
+                        else group.nonblank_log_prob
+                        for group in groups
+                    ]
+                )
+                combined = log_probs + nonblank_base.unsqueeze(1)
+                combined[:, blank_like_ids] = (
+                    log_probs[:, blank_like_ids] + blank_base.unsqueeze(1)
+                )
             top_values, top_indexes = combined.reshape(-1).topk(
                 min(self.beam, combined.numel())
             )
 
             next_hypotheses = _HypothesisList()
             for value, flat_index in zip(top_values, top_indexes):
+                if not bool(torch.isfinite(value)):
+                    continue
                 flat = int(flat_index.item())
                 hyp_index = flat // vocab_size
                 token = flat % vocab_size
@@ -1405,9 +1843,11 @@ class StatefulKeywordDecoder:
                 new_context_state = hyp.context_state
                 context_score = 0.0
                 tailing_blanks = hyp.num_tailing_blanks + 1
+                score_length = hyp.effective_score_length
 
                 if token not in (self.blank_id, self.unk_id):
                     new_ys.append(token)
+                    score_length += 1
                     new_timestamps.append(absolute_t)
                     new_ac_probs.append(float(probs[hyp_index, token].item()))
                     (
@@ -1417,9 +1857,18 @@ class StatefulKeywordDecoder:
                     ) = self.keywords_graph.forward_one_step(hyp.context_state, token)
                     tailing_blanks = 0
                     if new_context_state.token == -1:
-                        new_ys[-self.context_size :] = [-1] * (
-                            self.context_size - 1
-                        ) + [self.blank_id]
+                        if self.timing_policy.enabled:
+                            new_ys = self._initial_decoder_history()
+                        else:
+                            new_ys[-self.context_size :] = [-1] * (
+                                self.context_size - 1
+                            ) + [self.blank_id]
+                    if self.timing_policy.enabled:
+                        new_level = self._state_level(new_context_state)
+                        new_timestamps = (
+                            new_timestamps[-new_level:] if new_level else []
+                        )
+                        new_ac_probs = new_ac_probs[-new_level:] if new_level else []
 
                 next_hypotheses.add(
                     _DecoderHypothesis(
@@ -1429,11 +1878,15 @@ class StatefulKeywordDecoder:
                         timestamp=new_timestamps,
                         ac_probs=new_ac_probs,
                         num_tailing_blanks=tailing_blanks,
+                        use_timing_key=self.timing_policy.enabled,
+                        score_length=score_length,
                     )
                 )
 
             self.hypotheses = next_hypotheses
-            top = self.hypotheses.most_probable()
+            top = self._most_probable_detection_candidate()
+            if top is None:
+                continue
             detection = self._matched_detection(top)
             # Preserve the strict `>` behavior in the existing keywords_search.
             if (
@@ -1450,7 +1903,10 @@ class StatefulKeywordDecoder:
         """Match a keyword at EOS even if there are insufficient tail blanks."""
         if not self.hypotheses.data:
             return []
-        detection = self._matched_detection(self.hypotheses.most_probable())
+        top = self._most_probable_detection_candidate()
+        if top is None:
+            return []
+        detection = self._matched_detection(top)
         if detection is None:
             return []
         self._reset_hypotheses()
@@ -1468,6 +1924,8 @@ class MultiThresholdKeywordDecoder:
         beam: int,
         num_tailing_blanks: int,
         blank_penalty: float,
+        max_token_gap_sec: Optional[float] = None,
+        max_keyword_duration_sec: Optional[float] = None,
     ) -> None:
         if not keywords_graphs:
             raise ValueError("at least one keyword threshold is required")
@@ -1479,6 +1937,8 @@ class MultiThresholdKeywordDecoder:
                 beam=beam,
                 num_tailing_blanks=num_tailing_blanks,
                 blank_penalty=blank_penalty,
+                max_token_gap_sec=max_token_gap_sec,
+                max_keyword_duration_sec=max_keyword_duration_sec,
             )
             for threshold, graph in sorted(keywords_graphs.items())
         }
@@ -1489,6 +1949,13 @@ class MultiThresholdKeywordDecoder:
                 "MultiThresholdKeywordDecoder expects encoder_out shape (1, T, C)"
             )
         projected = self.model.joiner.encoder_proj(encoder_out)
+        return self.advance_projected(projected)
+
+    def advance_projected(self, projected: Any) -> Dict[float, List[Detection]]:
+        if projected.ndim != 3 or projected.size(0) != 1:
+            raise ValueError(
+                "MultiThresholdKeywordDecoder expects projected shape (1, T, C)"
+            )
         return {
             threshold: decoder.advance_projected(projected)
             for threshold, decoder in self.decoders.items()
@@ -1501,12 +1968,20 @@ class MultiThresholdKeywordDecoder:
         }
 
 
-def get_init_states(model: Any, device: Any) -> List[Any]:
+def get_init_states(
+    model: Any,
+    device: Any,
+    batch_size: int = 1,
+) -> List[Any]:
     import torch
 
-    states = model.encoder.get_init_states(batch_size=1, device=device)
-    states.append(model.encoder_embed.get_init_states(batch_size=1, device=device))
-    states.append(torch.zeros(1, dtype=torch.int32, device=device))
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    states = model.encoder.get_init_states(batch_size=batch_size, device=device)
+    states.append(
+        model.encoder_embed.get_init_states(batch_size=batch_size, device=device)
+    )
+    states.append(torch.zeros(batch_size, dtype=torch.int32, device=device))
     return states
 
 
@@ -1560,47 +2035,6 @@ def streaming_forward(
     )
 
 
-def load_audio(path: Path, sample_rate: int = SAMPLE_RATE) -> Any:
-    """Load, downmix, and deterministically resample to model-input audio."""
-    import soundfile as sf
-    import torch
-
-    data, source_sample_rate = sf.read(str(path), dtype="float32", always_2d=True)
-    if data.shape[0] == 0:
-        raise ValueError("audio is empty: {}".format(path))
-    waveform = torch.from_numpy(data).mean(dim=1).contiguous()
-    if not bool(torch.isfinite(waveform).all()):
-        raise ValueError("audio contains NaN or Inf: {}".format(path))
-    if source_sample_rate != sample_rate:
-        try:
-            import torchaudio.functional as audio_functional
-        except (ImportError, OSError) as error:
-            raise ImportError(
-                "torchaudio is required to resample {} Hz audio to {} Hz: {}".format(
-                    source_sample_rate, sample_rate, path
-                )
-            ) from error
-        waveform = audio_functional.resample(waveform, source_sample_rate, sample_rate)
-    return waveform.contiguous()
-
-
-def compute_fbank(waveform: Any, device: Any) -> Any:
-    """Compute the normalized 80-bin feature profile used by this recipe."""
-    from kaldifeat import Fbank, FbankOptions
-
-    options = FbankOptions()
-    options.device = device
-    options.frame_opts.dither = 0
-    options.frame_opts.snip_edges = False
-    options.frame_opts.samp_freq = SAMPLE_RATE
-    options.mel_opts.num_bins = 80
-    options.mel_opts.high_freq = -400
-    features = Fbank(options)(waveform.to(device))
-    if features.ndim != 2 or features.size(0) == 0:
-        raise ValueError("audio produced no usable fbank frames")
-    return features
-
-
 def run_keyword_inference_multi_threshold(
     *,
     runtime: LoadedRuntime,
@@ -1616,6 +2050,10 @@ def run_keyword_inference_multi_threshold(
         beam=args.beam,
         num_tailing_blanks=args.num_tailing_blanks,
         blank_penalty=args.blank_penalty,
+        max_token_gap_sec=getattr(runtime, "max_token_gap_sec", None),
+        max_keyword_duration_sec=getattr(
+            runtime, "max_keyword_duration_sec", None
+        ),
     )
     device = next(runtime.model.parameters()).device
     tail_frames = round(args.tail_padding_sec * 1000.0 / FBANK_FRAME_SHIFT_MS)
@@ -1686,6 +2124,144 @@ def run_keyword_inference_multi_threshold(
 
     finalize_all()
     return detections
+
+
+@dataclass
+class _ActiveKeywordBatchStream:
+    item: KeywordBatchItem
+    states: List[Any]
+    decoder: MultiThresholdKeywordDecoder
+    position: int
+    padded_frames: int
+    detections: Dict[float, List[Detection]]
+
+
+def run_keyword_inference_multi_threshold_batched(
+    *,
+    runtime: LoadedRuntime,
+    items: Iterable[KeywordBatchItem],
+    args: argparse.Namespace,
+    batch_size: int,
+) -> Iterator[Tuple[Any, Dict[float, List[Detection]]]]:
+    """Advance independent streams through one dynamically refilled encoder batch."""
+    import torch
+
+    if runtime.decode_mode != "streaming":
+        raise ValueError("multi-stream batching requires a causal streaming model")
+    if batch_size <= 0:
+        raise ValueError("stream_batch_size must be positive")
+
+    model = runtime.model
+    device = next(model.parameters()).device
+    chunk_size = int(runtime.params.chunk_size)
+    left_context = int(runtime.params.left_context_frames)
+    feature_step = chunk_size * 2
+    required_segment = feature_step + ENCODER_EMBED_PAD
+    tail_frames = round(args.tail_padding_sec * 1000.0 / FBANK_FRAME_SHIFT_MS)
+    source = iter(items)
+    source_exhausted = False
+    active: List[_ActiveKeywordBatchStream] = []
+
+    def add_stream(item: KeywordBatchItem) -> None:
+        features = item.features
+        if features.ndim != 2 or features.size(0) <= 0:
+            raise ValueError(
+                "batched KWS features must have shape (frames, bins), got {}".format(
+                    tuple(features.shape)
+                )
+            )
+        graphs = {float(key): value for key, value in item.keywords_graphs.items()}
+        decoder = MultiThresholdKeywordDecoder(
+            model=model,
+            keywords_graphs=graphs,
+            beam=args.beam,
+            num_tailing_blanks=args.num_tailing_blanks,
+            blank_penalty=args.blank_penalty,
+            max_token_gap_sec=getattr(runtime, "max_token_gap_sec", None),
+            max_keyword_duration_sec=getattr(
+                runtime, "max_keyword_duration_sec", None
+            ),
+        )
+        active.append(
+            _ActiveKeywordBatchStream(
+                item=item,
+                states=get_init_states(model, device, batch_size=1),
+                decoder=decoder,
+                position=0,
+                padded_frames=int(features.size(0))
+                + ENCODER_EMBED_PAD
+                + tail_frames,
+                detections={threshold: [] for threshold in graphs},
+            )
+        )
+
+    while active or not source_exhausted:
+        while len(active) < batch_size and not source_exhausted:
+            try:
+                add_stream(next(source))
+            except StopIteration:
+                source_exhausted = True
+        if not active:
+            break
+
+        segments = []
+        finishing = []
+        for stream in active:
+            features = stream.item.features
+            segment = features[
+                stream.position : stream.position + required_segment
+            ]
+            if segment.size(0) < required_segment:
+                segment = torch.nn.functional.pad(
+                    segment,
+                    (0, 0, 0, required_segment - segment.size(0)),
+                    value=LOG_EPS,
+                )
+            segments.append(segment.to(device))
+            stream.position += feature_step
+            finishing.append(stream.position >= stream.padded_frames)
+
+        feature_batch = torch.stack(segments, dim=0)
+        feature_lens = torch.full(
+            (len(active),),
+            required_segment,
+            dtype=torch.int64,
+            device=device,
+        )
+        batch_states = stack_states([stream.states for stream in active])
+        encoder_out, encoder_out_lens, new_batch_states = streaming_forward(
+            features=feature_batch,
+            feature_lens=feature_lens,
+            model=model,
+            states=batch_states,
+            chunk_size=chunk_size,
+            left_context_len=left_context,
+        )
+        stream_states = unstack_states(new_batch_states)
+        projected = model.joiner.encoder_proj(encoder_out)
+        completed = []
+        for index, stream in enumerate(active):
+            stream.states = stream_states[index]
+            valid = int(encoder_out_lens[index].item())
+            if valid:
+                values = stream.decoder.advance_projected(
+                    projected[index : index + 1, :valid, :]
+                )
+                for threshold, detections in values.items():
+                    stream.detections[threshold].extend(detections)
+            if finishing[index]:
+                for threshold, detections in stream.decoder.finalize().items():
+                    stream.detections[threshold].extend(detections)
+                completed.append(index)
+
+        results = [
+            (active[index].item.item_id, active[index].detections)
+            for index in completed
+        ]
+        for index in reversed(completed):
+            del active[index]
+        for result in results:
+            yield result
 
 
 def run_keyword_inference(
@@ -1777,6 +2353,16 @@ def _manifest_output_row(
             "chunk_size": runtime.params.chunk_size,
             "left_context_frames": runtime.params.left_context_frames,
             "keywords_threshold": _format_threshold(keyword_threshold),
+            "max_token_gap_sec": (
+                ""
+                if getattr(runtime, "max_token_gap_sec", None) is None
+                else _format_compact_float(runtime.max_token_gap_sec)
+            ),
+            "max_keyword_duration_sec": (
+                ""
+                if getattr(runtime, "max_keyword_duration_sec", None) is None
+                else _format_compact_float(runtime.max_keyword_duration_sec)
+            ),
         }
     )
     return row
@@ -1883,12 +2469,110 @@ def _manifest_thresholds(
     return parse_keywords_thresholds(args.keywords_thresholds)
 
 
+def _append_manifest_detections(
+    *,
+    entry: ManifestEntry,
+    detections_by_threshold: Mapping[float, List[Detection]],
+    thresholds: Sequence[float],
+    num_samples: int,
+    waveform: Optional[Any],
+    wav_root: Path,
+    output_manifest: Path,
+    output_rows: List[Dict[str, Any]],
+    protected_clip_paths: AbstractSet[Path],
+    runtime: LoadedRuntime,
+    args: argparse.Namespace,
+    multi_threshold_mode: bool,
+) -> int:
+    """Write one trial's hits, loading cached audio only after a valid hit."""
+    missed_thresholds = 0
+    loaded_waveform = waveform
+    for threshold in thresholds:
+        detections = list(detections_by_threshold[threshold])
+        detections.sort(key=lambda item: (item.start_frame, item.end_frame))
+        written = 0
+        for hit_index, detection in enumerate(detections):
+            bounds = compute_clip_bounds(
+                detection,
+                num_samples=num_samples,
+                sample_rate=SAMPLE_RATE,
+                pre_roll_sec=args.pre_roll_sec,
+                post_roll_sec=args.post_roll_sec,
+            )
+            if bounds is None:
+                logging.warning(
+                    "Ignoring out-of-range hit in manifest row %s "
+                    "at threshold %s: %s",
+                    entry.row_number,
+                    _format_threshold(threshold),
+                    detection.timestamp_frames,
+                )
+                continue
+            if loaded_waveform is None:
+                loaded_waveform = load_audio(entry.audio_path)
+                if int(loaded_waveform.numel()) != int(num_samples):
+                    raise RuntimeError(
+                        "cached num_samples={} differs from current audio length={} "
+                        "for {}".format(
+                            num_samples,
+                            loaded_waveform.numel(),
+                            entry.audio_path,
+                        )
+                    )
+            filename = make_clip_filename(
+                entry,
+                hit_index,
+                bounds,
+                keyword_threshold=(threshold if multi_threshold_mode else None),
+            )
+            clip_path = wav_root / filename
+            _ensure_output_is_not_protected(
+                clip_path, protected_clip_paths, "output WAV"
+            )
+            _write_wav_atomic(
+                clip_path,
+                loaded_waveform[bounds.start_sample : bounds.end_sample],
+                args.overwrite,
+            )
+            output_rows.append(
+                _manifest_output_row(
+                    entry=entry,
+                    detection=detection,
+                    hit_index=hit_index,
+                    bounds=bounds,
+                    clip_path=clip_path,
+                    output_manifest=output_manifest,
+                    runtime=runtime,
+                    keyword_threshold=threshold,
+                )
+            )
+            written += 1
+        if written == 0:
+            missed_thresholds += 1
+    return missed_thresholds
+
+
 def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
     import torch
 
     _, wav_root, output_manifest = _validate_output_layout(args)
     thresholds = _manifest_thresholds(args, runtime)
     multi_threshold_mode = args.keywords_thresholds is not None
+    stream_batch_size = int(getattr(args, "stream_batch_size", 1))
+    if stream_batch_size <= 0:
+        raise ValueError("--stream-batch-size must be positive")
+    feature_cache_dir = getattr(args, "feature_cache_dir", None)
+    if stream_batch_size > 1 and feature_cache_dir is None:
+        raise ValueError(
+            "--stream-batch-size greater than one requires --feature-cache-dir"
+        )
+    if stream_batch_size > 1 and not args.fail_fast:
+        raise ValueError(
+            "--stream-batch-size greater than one requires --fail-fast because "
+            "one encoder failure can affect every active stream"
+        )
+    if stream_batch_size > 1 and runtime.decode_mode != "streaming":
+        raise ValueError("--stream-batch-size greater than one requires streaming mode")
     input_manifest = args.manifest.expanduser().resolve()
     if output_manifest == input_manifest:
         raise ValueError("output manifest must not overwrite the input manifest")
@@ -1902,104 +2586,206 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
     protected_clip_paths = {input_manifest, output_manifest}.union(source_audio_paths)
     logging.info("Loaded %s manifest rows from %s", len(entries), args.manifest)
 
+    feature_cache = (
+        None
+        if feature_cache_dir is None
+        else FbankFeatureCache(feature_cache_dir, writable=False)
+    )
+    if feature_cache is not None:
+        unique_audio_paths = list(dict.fromkeys(entry.audio_path for entry in entries))
+        missing = [
+            path
+            for path in unique_audio_paths
+            if feature_cache.lookup_metadata(path) is None
+        ]
+        if missing:
+            preview = ", ".join(str(path) for path in missing[:3])
+            raise ValueError(
+                "feature cache is missing, stale, or corrupt for {} of {} unique "
+                "audio files (examples: {}). Run: {} {} prepare-features "
+                "--manifest {} --feature-cache-dir {}".format(
+                    len(missing),
+                    len(unique_audio_paths),
+                    preview,
+                    sys.executable,
+                    ZIPFORMER_RECIPE_DIR / "negative_kws_eval.py",
+                    args.manifest,
+                    feature_cache.root,
+                )
+            )
+
     graph_cache: Dict[str, Dict[float, Any]] = {}
     output_rows: List[Dict[str, Any]] = []
     errors: List[Tuple[int, str, str]] = []
     miss_trial_count = 0
+    event_mode = progress_events_requested()
+    progress_interval = max(1, len(entries) // 200)
+    display = ConsoleProgress(
+        total=len(entries),
+        description="KWS inference",
+        enabled=False if event_mode else getattr(args, "progress", None),
+        unit="trials",
+    )
+    if event_mode:
+        emit_progress_event(
+            completed=0,
+            total=len(entries),
+            clips=0,
+            misses=0,
+            errors=0,
+        )
 
-    for index, entry in enumerate(entries, start=1):
-        try:
-            if not entry.audio_path.is_file():
-                raise FileNotFoundError(
-                    "audio file not found: {}".format(entry.audio_path)
-                )
-            graphs = graph_cache.get(entry.keyword)
-            if graphs is None:
-                graphs = build_keywords_graphs(
-                    runtime.sp,
-                    [entry.keyword],
-                    score=runtime.keywords_score,
-                    thresholds=thresholds,
-                )
-                graph_cache[entry.keyword] = graphs
+    def graphs_for(entry: ManifestEntry) -> Dict[float, Any]:
+        graphs = graph_cache.get(entry.keyword)
+        if graphs is None:
+            graphs = build_keywords_graphs(
+                runtime.sp,
+                [entry.keyword],
+                score=runtime.keywords_score,
+                thresholds=thresholds,
+            )
+            graph_cache[entry.keyword] = graphs
+        return graphs
 
-            waveform = load_audio(entry.audio_path)
-            with torch.inference_mode():
-                features = compute_fbank(
-                    waveform, next(runtime.model.parameters()).device
-                )
-                detections_by_threshold = run_keyword_inference_multi_threshold(
-                    runtime=runtime,
-                    features=features,
-                    keywords_graphs=graphs,
-                    args=args,
-                )
-            for threshold in thresholds:
-                detections = detections_by_threshold[threshold]
-                detections.sort(key=lambda item: (item.start_frame, item.end_frame))
-                written = 0
-                for hit_index, detection in enumerate(detections):
-                    bounds = compute_clip_bounds(
-                        detection,
-                        num_samples=waveform.numel(),
-                        sample_rate=SAMPLE_RATE,
-                        pre_roll_sec=args.pre_roll_sec,
-                        post_roll_sec=args.post_roll_sec,
-                    )
-                    if bounds is None:
-                        logging.warning(
-                            "Ignoring out-of-range hit in manifest row %s "
-                            "at threshold %s: %s",
-                            entry.row_number,
-                            _format_threshold(threshold),
-                            detection.timestamp_frames,
-                        )
-                        continue
-                    filename = make_clip_filename(
-                        entry,
-                        hit_index,
-                        bounds,
-                        keyword_threshold=(threshold if multi_threshold_mode else None),
-                    )
-                    clip_path = wav_root / filename
-                    _ensure_output_is_not_protected(
-                        clip_path, protected_clip_paths, "output WAV"
-                    )
-                    _write_wav_atomic(
-                        clip_path,
-                        waveform[bounds.start_sample : bounds.end_sample],
-                        args.overwrite,
-                    )
-                    output_rows.append(
-                        _manifest_output_row(
-                            entry=entry,
-                            detection=detection,
-                            hit_index=hit_index,
-                            bounds=bounds,
-                            clip_path=clip_path,
-                            output_manifest=output_manifest,
-                            runtime=runtime,
-                            keyword_threshold=threshold,
-                        )
-                    )
-                    written += 1
-                if written == 0:
-                    miss_trial_count += 1
-        except Exception as error:
-            if args.fail_fast:
-                raise
-            logging.exception("Failed manifest row %s", entry.row_number)
-            errors.append((entry.row_number, str(entry.audio_path), str(error)))
-
-        if index % 100 == 0 or index == len(entries):
+    def publish_progress(completed: int) -> None:
+        if completed % 100 == 0 or completed == len(entries):
             logging.info(
                 "Processed %s/%s rows; clips=%s, missed-trials=%s, errors=%s",
-                index,
+                completed,
                 len(entries),
                 len(output_rows),
                 miss_trial_count,
                 len(errors),
             )
+        status = "clips={} misses={} errors={}".format(
+            len(output_rows), miss_trial_count, len(errors)
+        )
+        display.update(completed=completed, status=status)
+        if event_mode and (
+            completed % progress_interval == 0 or completed == len(entries)
+        ):
+            emit_progress_event(
+                completed=completed,
+                total=len(entries),
+                clips=len(output_rows),
+                misses=miss_trial_count,
+                errors=len(errors),
+            )
+
+    if stream_batch_size == 1:
+        device = next(runtime.model.parameters()).device
+        for index, entry in display.track(enumerate(entries, start=1)):
+            try:
+                waveform = None
+                if feature_cache is None:
+                    waveform = load_audio(entry.audio_path)
+                    num_samples = int(waveform.numel())
+                    features = compute_fbank(waveform, device)
+                else:
+                    cached = feature_cache.load(entry.audio_path)
+                    if cached is None:
+                        raise RuntimeError(
+                            "feature cache became unavailable for {}".format(
+                                entry.audio_path
+                            )
+                        )
+                    num_samples = cached.num_samples
+                    features = cached.features.to(device)
+                with torch.inference_mode():
+                    detections_by_threshold = run_keyword_inference_multi_threshold(
+                        runtime=runtime,
+                        features=features,
+                        keywords_graphs=graphs_for(entry),
+                        args=args,
+                    )
+                miss_trial_count += _append_manifest_detections(
+                    entry=entry,
+                    detections_by_threshold=detections_by_threshold,
+                    thresholds=thresholds,
+                    num_samples=num_samples,
+                    waveform=waveform,
+                    wav_root=wav_root,
+                    output_manifest=output_manifest,
+                    output_rows=output_rows,
+                    protected_clip_paths=protected_clip_paths,
+                    runtime=runtime,
+                    args=args,
+                    multi_threshold_mode=multi_threshold_mode,
+                )
+            except Exception as error:
+                errors.append((entry.row_number, str(entry.audio_path), str(error)))
+                if args.fail_fast:
+                    publish_progress(index)
+                    raise
+                logging.exception("Failed manifest row %s", entry.row_number)
+            publish_progress(index)
+    else:
+        assert feature_cache is not None
+        contexts: Dict[int, Tuple[ManifestEntry, int]] = {}
+
+        def batch_items() -> Iterator[KeywordBatchItem]:
+            for item_id, entry in enumerate(entries):
+                cached = feature_cache.load(entry.audio_path)
+                if cached is None:
+                    raise RuntimeError(
+                        "feature cache became unavailable for {}".format(
+                            entry.audio_path
+                        )
+                    )
+                contexts[item_id] = (entry, cached.num_samples)
+                yield KeywordBatchItem(
+                    item_id=item_id,
+                    features=cached.features,
+                    keywords_graphs=graphs_for(entry),
+                )
+
+        results = run_keyword_inference_multi_threshold_batched(
+            runtime=runtime,
+            items=batch_items(),
+            args=args,
+            batch_size=stream_batch_size,
+        )
+        completed = 0
+        with torch.inference_mode():
+            for item_id, detections_by_threshold in display.track(results):
+                entry, num_samples = contexts.pop(int(item_id))
+                try:
+                    miss_trial_count += _append_manifest_detections(
+                        entry=entry,
+                        detections_by_threshold=detections_by_threshold,
+                        thresholds=thresholds,
+                        num_samples=num_samples,
+                        waveform=None,
+                        wav_root=wav_root,
+                        output_manifest=output_manifest,
+                        output_rows=output_rows,
+                        protected_clip_paths=protected_clip_paths,
+                        runtime=runtime,
+                        args=args,
+                        multi_threshold_mode=multi_threshold_mode,
+                    )
+                except Exception as error:
+                    errors.append((entry.row_number, str(entry.audio_path), str(error)))
+                    completed += 1
+                    publish_progress(completed)
+                    if args.fail_fast:
+                        raise
+                    logging.exception("Failed manifest row %s", entry.row_number)
+                    continue
+                completed += 1
+                publish_progress(completed)
+
+        threshold_order = {
+            _format_threshold(value): index for index, value in enumerate(thresholds)
+        }
+        output_rows.sort(
+            key=lambda row: (
+                int(row["source_manifest_row"]),
+                threshold_order[str(row["keywords_threshold"])],
+                int(row["hit_index"]),
+                int(row["start_sample"]),
+            )
+        )
 
     write_output_manifest(
         output_manifest,
@@ -2028,6 +2814,21 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = get_parser().parse_args(argv)
+    if args.stream_batch_size <= 0:
+        raise ValueError("--stream-batch-size must be positive")
+    if args.wav is not None and args.feature_cache_dir is not None:
+        raise ValueError("--feature-cache-dir is supported only with --manifest")
+    if args.wav is not None and args.stream_batch_size != 1:
+        raise ValueError("--stream-batch-size is supported only with --manifest")
+    if args.stream_batch_size > 1 and args.feature_cache_dir is None:
+        raise ValueError(
+            "--stream-batch-size greater than one requires --feature-cache-dir"
+        )
+    if args.stream_batch_size > 1 and not args.fail_fast:
+        raise ValueError(
+            "--stream-batch-size greater than one requires --fail-fast because "
+            "one encoder failure can affect every active stream"
+        )
     if args.keywords_thresholds is not None:
         if args.keywords_threshold is not None:
             raise ValueError(

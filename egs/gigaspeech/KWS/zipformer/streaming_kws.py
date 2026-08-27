@@ -79,6 +79,11 @@ if str(ZIPFORMER_RECIPE_DIR) not in sys.path:
 if str(ICEFALL_ROOT) not in sys.path:
     sys.path.insert(0, str(ICEFALL_ROOT))
 
+from kws_eval_artifacts import (  # noqa: E402
+    ARTIFACT_FILENAMES,
+    build_result_record as build_evaluation_result,
+    write_evaluation_artifacts,
+)
 from kws_feature_cache import (  # noqa: E402
     FbankFeatureCache,
     SAMPLE_RATE,
@@ -714,6 +719,8 @@ def load_manifest(path: Path) -> Tuple[List[ManifestEntry], List[str]]:
                     label=label,
                 )
             )
+    if not entries:
+        raise ValueError("manifest contains no trials: {}".format(path))
     return entries, fieldnames
 
 
@@ -1004,6 +1011,7 @@ class LoadedRuntime:
     config: Dict[str, Any]
     max_token_gap_sec: Optional[float] = None
     max_keyword_duration_sec: Optional[float] = None
+    bpe_model_path: Optional[Path] = None
 
 
 def _resolve_optional_positive_seconds(
@@ -1251,6 +1259,7 @@ def load_runtime(args: argparse.Namespace) -> LoadedRuntime:
         config=config,
         max_token_gap_sec=max_token_gap_sec,
         max_keyword_duration_sec=max_keyword_duration_sec,
+        bpe_model_path=bpe_path,
     )
 
 
@@ -2368,6 +2377,247 @@ def _manifest_output_row(
     return row
 
 
+def _evaluation_manifest_meta(entry: ManifestEntry) -> Dict[str, Any]:
+    return {
+        name: value
+        for name, value in entry.row.items()
+        if name not in {"audio_path", "keyword", "label"}
+    }
+
+
+def _evaluation_events(
+    detections: Optional[Sequence[Detection]],
+    rows: Sequence[Mapping[str, Any]],
+    output_manifest: Path,
+    artifact_output_dir: Path,
+) -> List[Dict[str, Any]]:
+    """Keep emitted hits authoritative and attach clip metadata when available."""
+    artifact_output_dir = artifact_output_dir.expanduser().resolve()
+    rows_by_hit = {
+        int(row.get("hit_index", index)): row for index, row in enumerate(rows)
+    }
+    ordered_detections = None
+    if detections is not None:
+        ordered_detections = sorted(
+            detections, key=lambda item: (item.start_frame, item.end_frame)
+        )
+    event_sources: List[Tuple[Optional[Detection], Mapping[str, Any]]] = []
+    if ordered_detections is None:
+        event_sources.extend((None, row) for row in rows)
+    else:
+        for hit_index, detection in enumerate(ordered_detections):
+            event_sources.append((detection, rows_by_hit.get(hit_index, {})))
+
+    events = []
+    for fallback_index, (detection, row) in enumerate(event_sources):
+        hit_index = int(row.get("hit_index", fallback_index))
+        timestamps: Any
+        if detection is not None:
+            timestamps = list(detection.timestamp_frames)
+            score = float(detection.score)
+            phrase = detection.phrase
+        else:
+            timestamps = row.get("timestamp_frames", [])
+            if isinstance(timestamps, str):
+                try:
+                    timestamps = json.loads(timestamps)
+                except json.JSONDecodeError:
+                    timestamps = []
+            score = float(row["score"])
+            phrase = str(row.get("detected_keyword", ""))
+        event: Dict[str, Any] = {
+            "score": score,
+            "detected_keyword": str(phrase),
+            "hit_index": hit_index,
+            "timestamp_frames": timestamps,
+            "clip_exported": bool(row),
+        }
+        for name in (
+            "raw_start_sec",
+            "raw_end_sec",
+            "start_sec",
+            "end_sec",
+            "duration_sec",
+        ):
+            if row.get(name) not in (None, ""):
+                event[name] = float(row[name])
+        if row.get("audio_path") not in (None, ""):
+            clip_audio_path = Path(str(row["audio_path"]))
+            event["clip_manifest_audio_path"] = clip_audio_path.as_posix()
+            if not clip_audio_path.is_absolute():
+                clip_audio_path = output_manifest.parent / clip_audio_path
+            resolved_clip = clip_audio_path.resolve()
+            event["clip_audio_path"] = Path(
+                os.path.relpath(str(resolved_clip), str(artifact_output_dir))
+            ).as_posix()
+            event["clip_audio_path_resolved"] = str(resolved_clip)
+        if row.get("tail_anchored") not in (None, ""):
+            event["tail_anchored"] = bool(int(row["tail_anchored"]))
+        events.append(event)
+    return events
+
+
+def _source_duration_fallback(entry: ManifestEntry) -> Optional[float]:
+    for name in ("source_duration_sec", "duration_sec"):
+        raw_value = entry.row.get(name)
+        if raw_value in (None, ""):
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0.0:
+            return value
+    return None
+
+
+def _append_evaluation_trial_results(
+    *,
+    records: List[Dict[str, Any]],
+    entry: ManifestEntry,
+    thresholds: Sequence[float],
+    output_rows: Sequence[Mapping[str, Any]],
+    output_manifest: Path,
+    artifact_output_dir: Path,
+    detections_by_threshold: Optional[Mapping[float, Sequence[Detection]]],
+    num_samples: Optional[int],
+    error: Optional[BaseException] = None,
+) -> None:
+    """Add every exact threshold observation, including zero-hit trials."""
+    duration_sec = (
+        float(num_samples) / SAMPLE_RATE
+        if num_samples is not None and num_samples > 0
+        else _source_duration_fallback(entry)
+    )
+    pending = []
+    for threshold in thresholds:
+        threshold_key = _format_threshold(threshold)
+        threshold_rows = [
+            row
+            for row in output_rows
+            if str(row.get("keywords_threshold", "")) == threshold_key
+        ]
+        detections = (
+            None
+            if detections_by_threshold is None
+            else detections_by_threshold.get(float(threshold), ())
+        )
+        pending.append(
+            build_evaluation_result(
+                source_manifest_row=entry.row_number,
+                audio_path=str(entry.row["audio_path"]),
+                audio_path_resolved=str(entry.audio_path),
+                keyword=entry.keyword,
+                label=entry.label,
+                threshold=threshold,
+                events=_evaluation_events(
+                    detections,
+                    threshold_rows,
+                    output_manifest,
+                    artifact_output_dir,
+                ),
+                duration_sec=duration_sec,
+                skipped=error is not None,
+                error=None if error is None else str(error),
+                manifest_meta=_evaluation_manifest_meta(entry),
+            )
+        )
+    records.extend(pending)
+
+
+def _file_identity(path: Path) -> Dict[str, Any]:
+    resolved = path.expanduser().resolve()
+    digest = hashlib.sha256()
+    with resolved.open("rb") as handle:
+        while True:
+            block = handle.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    stat = resolved.stat()
+    return {
+        "path": str(resolved),
+        "size_bytes": int(stat.st_size),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _file_identity_if_available(path: Path) -> Dict[str, Any]:
+    resolved = path.expanduser().resolve()
+    if resolved.is_file():
+        return _file_identity(resolved)
+    return {
+        "path": str(resolved),
+        "size_bytes": None,
+        "sha256": None,
+        "status": "unavailable_at_artifact_write",
+    }
+
+
+def _evaluation_provenance(
+    args: argparse.Namespace,
+    runtime: LoadedRuntime,
+    *,
+    input_manifest: Path,
+    output_manifest: Path,
+) -> Dict[str, Any]:
+    params = getattr(runtime, "params", None)
+    result: Dict[str, Any] = {
+        "decode_mode": getattr(runtime, "decode_mode", "unknown"),
+        "stream": {
+            "chunk_size": getattr(params, "chunk_size", None),
+            "left_context_frames": getattr(params, "left_context_frames", None),
+        },
+        "keywords_score": float(runtime.keywords_score),
+        "configured_keywords_threshold": float(runtime.keywords_threshold),
+        "max_token_gap_sec": getattr(runtime, "max_token_gap_sec", None),
+        "max_keyword_duration_sec": getattr(
+            runtime, "max_keyword_duration_sec", None
+        ),
+        "decode_parameters": {
+            name: getattr(args, name, None)
+            for name in (
+                "beam",
+                "blank_penalty",
+                "num_tailing_blanks",
+                "tail_padding_sec",
+                "pre_roll_sec",
+                "post_roll_sec",
+                "stream_batch_size",
+                "checkpoint_key",
+                "device",
+            )
+        },
+        "model_parameters": {
+            "causal": getattr(params, "causal", None),
+        },
+        "files": {
+            "streaming_kws": _file_identity(Path(__file__)),
+            "input_manifest": _file_identity(input_manifest),
+            "output_manifest": _file_identity_if_available(output_manifest),
+        },
+    }
+    checkpoint_path = getattr(runtime, "checkpoint_path", None)
+    if checkpoint_path is not None:
+        result["files"]["checkpoint"] = _file_identity_if_available(
+            checkpoint_path
+        )
+    bpe_model_path = getattr(runtime, "bpe_model_path", None)
+    if bpe_model_path is not None:
+        result["files"]["bpe_model"] = _file_identity_if_available(
+            bpe_model_path
+        )
+    model_config = getattr(args, "model_config", None)
+    if model_config is not None:
+        result["files"]["model_config"] = _file_identity(model_config)
+    feature_cache_dir = getattr(args, "feature_cache_dir", None)
+    if feature_cache_dir is not None:
+        result["feature_cache_dir"] = str(
+            Path(feature_cache_dir).expanduser().resolve()
+        )
+    return result
+
+
 def _keywords_for_single_wav(
     args: argparse.Namespace, config: Mapping[str, Any]
 ) -> List[str]:
@@ -2436,12 +2686,48 @@ def _validate_output_layout(args: argparse.Namespace) -> Tuple[Path, Path, Path]
         raise ValueError("--wav-subdir must stay under --output-dir") from error
     if common != output_dir:
         raise ValueError("--wav-subdir must stay under --output-dir")
-    if output_manifest.exists() and not args.overwrite:
-        raise FileExistsError(
-            "output manifest already exists (pass --overwrite): {}".format(
-                output_manifest
-            )
+    if wav_root.exists() and not wav_root.is_dir():
+        raise ValueError(
+            "--wav-subdir resolves to a non-directory: {}".format(wav_root)
         )
+    if output_manifest.exists() and output_manifest.is_dir():
+        raise ValueError(
+            "--output-manifest resolves to a directory: {}".format(output_manifest)
+        )
+    artifact_paths = [output_dir / name for name in ARTIFACT_FILENAMES]
+    for path in artifact_paths:
+        if (
+            path.is_symlink()
+            or (path.exists() and not path.is_file())
+            or path.resolve().parent != output_dir
+        ):
+            raise ValueError(
+                "evaluation artifact path must stay directly under "
+                "--output-dir and must not be a symlink: {}".format(path)
+            )
+        resolved_artifact = path.resolve()
+        for managed_path, description in (
+            (wav_root, "--wav-subdir"),
+            (output_manifest, "--output-manifest"),
+        ):
+            if (
+                resolved_artifact == managed_path
+                or resolved_artifact in managed_path.parents
+                or (
+                    description == "--output-manifest"
+                    and managed_path in resolved_artifact.parents
+                )
+            ):
+                raise ValueError(
+                    "{} must not be nested below reserved evaluation artifact "
+                    "path {}".format(description, resolved_artifact)
+                )
+    if not args.overwrite:
+        for path in [output_manifest] + artifact_paths:
+            if path.exists():
+                raise FileExistsError(
+                    "output already exists (pass --overwrite): {}".format(path)
+                )
     return output_dir, wav_root, output_manifest
 
 
@@ -2555,7 +2841,7 @@ def _append_manifest_detections(
 def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
     import torch
 
-    _, wav_root, output_manifest = _validate_output_layout(args)
+    output_dir, wav_root, output_manifest = _validate_output_layout(args)
     thresholds = _manifest_thresholds(args, runtime)
     multi_threshold_mode = args.keywords_thresholds is not None
     stream_batch_size = int(getattr(args, "stream_batch_size", 1))
@@ -2583,7 +2869,18 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
         {input_manifest}.union(source_audio_paths),
         "output manifest",
     )
-    protected_clip_paths = {input_manifest, output_manifest}.union(source_audio_paths)
+    evaluation_paths = {output_dir / name for name in ARTIFACT_FILENAMES}
+    for path in evaluation_paths:
+        _ensure_output_is_not_protected(
+            path,
+            {input_manifest}.union(source_audio_paths),
+            "evaluation artifact",
+        )
+    protected_clip_paths = (
+        {input_manifest, output_manifest}
+        .union(source_audio_paths)
+        .union(evaluation_paths)
+    )
     logging.info("Loaded %s manifest rows from %s", len(entries), args.manifest)
 
     feature_cache = (
@@ -2616,6 +2913,7 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
 
     graph_cache: Dict[str, Dict[float, Any]] = {}
     output_rows: List[Dict[str, Any]] = []
+    evaluation_records: List[Dict[str, Any]] = []
     errors: List[Tuple[int, str, str]] = []
     miss_trial_count = 0
     event_mode = progress_events_requested()
@@ -2675,6 +2973,11 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
     if stream_batch_size == 1:
         device = next(runtime.model.parameters()).device
         for index, entry in display.track(enumerate(entries, start=1)):
+            trial_output_start = len(output_rows)
+            num_samples: Optional[int] = None
+            detections_by_threshold: Optional[
+                Mapping[float, Sequence[Detection]]
+            ] = None
             try:
                 waveform = None
                 if feature_cache is None:
@@ -2712,8 +3015,29 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
                     args=args,
                     multi_threshold_mode=multi_threshold_mode,
                 )
+                _append_evaluation_trial_results(
+                    records=evaluation_records,
+                    entry=entry,
+                    thresholds=thresholds,
+                    output_rows=output_rows[trial_output_start:],
+                    output_manifest=output_manifest,
+                    artifact_output_dir=output_dir,
+                    detections_by_threshold=detections_by_threshold,
+                    num_samples=num_samples,
+                )
             except Exception as error:
                 errors.append((entry.row_number, str(entry.audio_path), str(error)))
+                _append_evaluation_trial_results(
+                    records=evaluation_records,
+                    entry=entry,
+                    thresholds=thresholds,
+                    output_rows=output_rows[trial_output_start:],
+                    output_manifest=output_manifest,
+                    artifact_output_dir=output_dir,
+                    detections_by_threshold=detections_by_threshold,
+                    num_samples=num_samples,
+                    error=error,
+                )
                 if args.fail_fast:
                     publish_progress(index)
                     raise
@@ -2749,6 +3073,7 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
         with torch.inference_mode():
             for item_id, detections_by_threshold in display.track(results):
                 entry, num_samples = contexts.pop(int(item_id))
+                trial_output_start = len(output_rows)
                 try:
                     miss_trial_count += _append_manifest_detections(
                         entry=entry,
@@ -2764,8 +3089,29 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
                         args=args,
                         multi_threshold_mode=multi_threshold_mode,
                     )
+                    _append_evaluation_trial_results(
+                        records=evaluation_records,
+                        entry=entry,
+                        thresholds=thresholds,
+                        output_rows=output_rows[trial_output_start:],
+                        output_manifest=output_manifest,
+                        artifact_output_dir=output_dir,
+                        detections_by_threshold=detections_by_threshold,
+                        num_samples=num_samples,
+                    )
                 except Exception as error:
                     errors.append((entry.row_number, str(entry.audio_path), str(error)))
+                    _append_evaluation_trial_results(
+                        records=evaluation_records,
+                        entry=entry,
+                        thresholds=thresholds,
+                        output_rows=output_rows[trial_output_start:],
+                        output_manifest=output_manifest,
+                        artifact_output_dir=output_dir,
+                        detections_by_threshold=detections_by_threshold,
+                        num_samples=num_samples,
+                        error=error,
+                    )
                     completed += 1
                     publish_progress(completed)
                     if args.fail_fast:
@@ -2793,6 +3139,20 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
         input_fields,
         overwrite=args.overwrite,
     )
+    artifacts = write_evaluation_artifacts(
+        output_dir=output_dir,
+        records=evaluation_records,
+        thresholds=thresholds,
+        manifest_path=input_manifest,
+        overwrite=args.overwrite,
+        mode="auto",
+        summary_metadata=_evaluation_provenance(
+            args,
+            runtime,
+            input_manifest=input_manifest,
+            output_manifest=output_manifest,
+        ),
+    )
     logging.info(
         "Wrote %s clips and %s to %s " "(thresholds=%s, missed-trials=%s, errors=%s)",
         len(output_rows),
@@ -2801,6 +3161,10 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
         ",".join(_format_threshold(value) for value in thresholds),
         miss_trial_count,
         len(errors),
+    )
+    logging.info(
+        "Wrote evaluation artifacts: %s",
+        ", ".join(str(Path(path).name) for path in artifacts.values()),
     )
     if errors:
         preview = "; ".join(

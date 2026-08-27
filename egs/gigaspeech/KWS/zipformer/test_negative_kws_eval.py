@@ -39,6 +39,13 @@ def write_csv(path, fieldnames, rows):
         writer.writerows(rows)
 
 
+def write_jsonl(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+
+
 def read_csv(path):
     with path.open("r", encoding="utf-8", newline="") as handle:
         return list(csv.DictReader(handle))
@@ -501,6 +508,54 @@ class TestOutputSafety(unittest.TestCase):
 
 
 class TestReport(unittest.TestCase):
+    def test_exact_results_accept_missing_label_only_for_assume_negative(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.jsonl"
+            write_jsonl(
+                path,
+                [
+                    MODULE.build_evaluation_result(
+                        source_manifest_row=2,
+                        audio_path="noise.wav",
+                        audio_path_resolved="/dataset/noise.wav",
+                        keyword="WAKE",
+                        threshold=0.5,
+                        events=[{"score": 0.8}],
+                        duration_sec=10.0,
+                    )
+                ],
+            )
+            exposure = {
+                2: {
+                    "source_manifest_row": 2,
+                    "audio_path": "noise.wav",
+                    "audio_path_resolved": "/dataset/noise.wav",
+                    "keyword": "WAKE",
+                    "label": "0",
+                    "category": "noise",
+                    "duration_sec": 10.0,
+                }
+            }
+
+            with self.assertRaisesRegex(
+                MODULE.EvaluationError, "negative label"
+            ):
+                MODULE._load_exact_results(
+                    path,
+                    thresholds=("0.5",),
+                    exposure_by_row=exposure,
+                )
+            records, hits = MODULE._load_exact_results(
+                path,
+                thresholds=("0.5",),
+                exposure_by_row=exposure,
+                allow_missing_label=True,
+            )
+
+            self.assertEqual(records[0]["label"], 0)
+            self.assertEqual(records[0]["false_alarm_events"], 1)
+            self.assertEqual(hits[("0.5", 2)], [0.8])
+
     def test_report_preserves_zero_hits_and_counts_events_and_trials(self):
         with tempfile.TemporaryDirectory() as directory:
             run_dir = Path(directory) / "run"
@@ -551,6 +606,74 @@ class TestReport(unittest.TestCase):
                     },
                 ],
             )
+            inference_results_path = run_dir / "inference" / "results.jsonl"
+            write_jsonl(
+                inference_results_path,
+                [
+                    MODULE.build_evaluation_result(
+                        source_manifest_row=2,
+                        audio_path="music.wav",
+                        audio_path_resolved="/dataset/music.wav",
+                        keyword="WAKE",
+                        label=0,
+                        threshold=0.2,
+                        events=[
+                            {
+                                "score": 0.91,
+                                "timestamp_frames": [10, 11],
+                                "clip_exported": False,
+                                "raw_event_id": "music-0",
+                            },
+                            {
+                                "score": 0.88,
+                                "timestamp_frames": [20, 21],
+                                "clip_exported": False,
+                                "raw_event_id": "music-1",
+                            },
+                        ],
+                        duration_sec=1800,
+                        manifest_meta={"category": "music"},
+                    ),
+                    MODULE.build_evaluation_result(
+                        source_manifest_row=2,
+                        audio_path="music.wav",
+                        audio_path_resolved="/dataset/music.wav",
+                        keyword="WAKE",
+                        label=0,
+                        threshold=0.8,
+                        duration_sec=1800,
+                        manifest_meta={"category": "music"},
+                    ),
+                    MODULE.build_evaluation_result(
+                        source_manifest_row=3,
+                        audio_path="noise.wav",
+                        audio_path_resolved="/dataset/noise.wav",
+                        keyword="WAKE",
+                        label=0,
+                        threshold=0.2,
+                        events=[
+                            {
+                                "score": 0.75,
+                                "timestamp_frames": [30, 31],
+                                "clip_exported": False,
+                                "raw_event_id": "noise-0",
+                            }
+                        ],
+                        duration_sec=1800,
+                        manifest_meta={"category": "noise"},
+                    ),
+                    MODULE.build_evaluation_result(
+                        source_manifest_row=3,
+                        audio_path="noise.wav",
+                        audio_path_resolved="/dataset/noise.wav",
+                        keyword="WAKE",
+                        label=0,
+                        threshold=0.8,
+                        duration_sec=1800,
+                        manifest_meta={"category": "noise"},
+                    ),
+                ],
+            )
             (run_dir / "run.json").write_text(
                 json.dumps(
                     {
@@ -562,6 +685,10 @@ class TestReport(unittest.TestCase):
                         "exposure_csv_sha256": MODULE._sha256(exposure_path),
                         "event_manifest": "inference/manifest.csv",
                         "event_manifest_sha256": MODULE._sha256(event_path),
+                        "inference_results_jsonl": "inference/results.jsonl",
+                        "inference_results_jsonl_sha256": MODULE._sha256(
+                            inference_results_path
+                        ),
                         "report_dir": "report",
                     }
                 ),
@@ -573,6 +700,21 @@ class TestReport(unittest.TestCase):
             )
 
             self.assertEqual(return_code, 0, stderr)
+            updated_run = json.loads(
+                (run_dir / "run.json").read_text(encoding="utf-8")
+            )
+            with self.subTest("run_report persists rebuilt artifacts"):
+                self.assertIn("artifacts", updated_run)
+                self.assertEqual(
+                    updated_run["artifacts"]["results_jsonl"], "results.jsonl"
+                )
+                self.assertEqual(
+                    updated_run["artifacts"]["threshold_scan_csv"],
+                    "threshold_scan.csv",
+                )
+                self.assertEqual(
+                    updated_run["artifacts"]["report_html"], "report/report.html"
+                )
             metrics = read_csv(run_dir / "report" / "threshold_metrics.csv")
             indexed = {
                 (row["threshold"], row["keyword"], row["category"]): row
@@ -609,6 +751,56 @@ class TestReport(unittest.TestCase):
             )
             self.assertEqual(summary["event_count"], 3)
             self.assertEqual(summary["source_trials"], 2)
+            for filename in (
+                "results.jsonl",
+                "summary.json",
+                "threshold_scan_summary.json",
+                "threshold_scan.csv",
+                "threshold_scan.png",
+            ):
+                self.assertTrue((run_dir / filename).is_file(), filename)
+            standard_results = [
+                json.loads(line)
+                for line in (run_dir / "results.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(standard_results), 4)
+            low_music_result = next(
+                row
+                for row in standard_results
+                if row["source_manifest_row"] == 2 and row["threshold"] == 0.2
+            )
+            self.assertEqual(low_music_result["detection_count"], 2)
+            with self.subTest("report preserves raw inference events"):
+                self.assertEqual(
+                    [
+                        event["raw_event_id"]
+                        for event in low_music_result["detections"]
+                    ],
+                    ["music-0", "music-1"],
+                )
+                self.assertEqual(
+                    [
+                        event["timestamp_frames"]
+                        for event in low_music_result["detections"]
+                    ],
+                    [[10, 11], [20, 21]],
+                )
+                self.assertFalse(
+                    any(
+                        event["clip_exported"]
+                        for event in low_music_result["detections"]
+                    )
+                )
+            scan_rows = read_csv(run_dir / "threshold_scan.csv")
+            self.assertEqual([row["threshold"] for row in scan_rows], ["0.8", "0.2"])
+            self.assertEqual(int(scan_rows[1]["fp"]), 2)
+            self.assertAlmostEqual(float(scan_rows[1]["fa_per_hour"]), 3.0)
+            self.assertEqual(
+                (run_dir / "threshold_scan.png").read_bytes()[:8],
+                b"\x89PNG\r\n\x1a\n",
+            )
             svg_paths = sorted((run_dir / "report").glob("*.svg"))
             self.assertEqual(len(svg_paths), 2)
             for path in svg_paths:
@@ -763,6 +955,14 @@ with output.open("w", encoding="utf-8", newline="") as handle:
             run = json.loads((output_dir / "run.json").read_text(encoding="utf-8"))
             self.assertEqual(run["status"], "complete")
             self.assertEqual(run["decoder_return_code"], 0)
+            for filename in (
+                "results.jsonl",
+                "summary.json",
+                "threshold_scan_summary.json",
+                "threshold_scan.csv",
+                "threshold_scan.png",
+            ):
+                self.assertTrue((output_dir / filename).is_file(), filename)
 
             resume_args = sweep_args("--resume")
             resume_args.insert(resume_args.index("--"), "--no-progress")

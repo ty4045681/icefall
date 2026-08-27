@@ -3,6 +3,7 @@
 import contextlib
 import csv
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -167,6 +168,14 @@ class TestManifestAndTimestamps(unittest.TestCase):
                 "audio_path,keyword,label\na.wav,hey eva,2\n", encoding="utf-8"
             )
             with self.assertRaisesRegex(ValueError, "label must be 0 or 1"):
+                MODULE.load_manifest(manifest)
+
+    def test_manifest_rejects_empty_trial_set(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "manifest.csv"
+            manifest.write_text("audio_path,keyword,label\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "contains no trials"):
                 MODULE.load_manifest(manifest)
 
     def test_manifest_trims_header_whitespace_like_dma_loader(self):
@@ -407,6 +416,84 @@ class TestManifestAndTimestamps(unittest.TestCase):
             safe = root / "wavs" / "generated.wav"
             MODULE._ensure_output_is_not_protected(safe, protected, "generated output")
 
+    def test_evaluation_artifact_names_cannot_become_output_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "output"
+            base = {
+                "output_dir": output_dir,
+                "output_manifest": None,
+                "wav_subdir": "wavs",
+                "pre_roll_sec": 0.0,
+                "post_roll_sec": 0.0,
+                "overwrite": True,
+            }
+            cases = (
+                {"wav_subdir": "results.jsonl/wavs"},
+                {"output_manifest": output_dir / "summary.json" / "nested.csv"},
+                {"output_manifest": output_dir},
+            )
+            for overrides in cases:
+                with self.subTest(overrides=overrides), self.assertRaisesRegex(
+                    ValueError, "reserved evaluation artifact|directory"
+                ):
+                    MODULE._validate_output_layout(
+                        SimpleNamespace(**{**base, **overrides})
+                    )
+
+    def test_evaluation_records_keep_emitted_hit_without_exported_clip(self):
+        entry = MODULE.ManifestEntry(
+            row_number=2,
+            row={"audio_path": "audio.wav", "keyword": "WAKE", "label": "0"},
+            audio_path=Path("/dataset/audio.wav"),
+            keyword="WAKE",
+            label=0,
+        )
+        detection = MODULE.Detection("WAKE", [10, 11], 0.9)
+        records = []
+        MODULE._append_evaluation_trial_results(
+            records=records,
+            entry=entry,
+            thresholds=(0.5,),
+            output_rows=(),
+            output_manifest=Path("/output/manifest.csv"),
+            artifact_output_dir=Path("/output"),
+            detections_by_threshold={0.5: [detection]},
+            num_samples=16000,
+        )
+        self.assertEqual(len(records), 1)
+        self.assertTrue(records[0]["detected"])
+        self.assertEqual(records[0]["qbyt_score"], 0.9)
+        self.assertFalse(records[0]["detections"][0]["clip_exported"])
+        self.assertEqual(records[0]["detections"][0]["timestamp_frames"], [10, 11])
+
+    def test_evaluation_clip_path_is_resolved_from_output_manifest(self):
+        detection = MODULE.Detection("WAKE", [10, 11], 0.9)
+        events = MODULE._evaluation_events(
+            [detection],
+            [
+                {
+                    "hit_index": 0,
+                    "score": "0.9",
+                    "audio_path": "../../output/wavs/hit.wav",
+                    "start_sec": "0.1",
+                    "end_sec": "0.3",
+                }
+            ],
+            Path("/evaluation/manifests/nested/manifest.csv"),
+            Path("/evaluation/output"),
+        )
+
+        self.assertEqual(events[0]["clip_audio_path"], "wavs/hit.wav")
+        self.assertEqual(
+            events[0]["clip_manifest_audio_path"],
+            "../../output/wavs/hit.wav",
+        )
+        self.assertEqual(
+            events[0]["clip_audio_path_resolved"],
+            "/evaluation/output/wavs/hit.wav",
+        )
+        self.assertTrue(events[0]["clip_exported"])
+
     def test_training_policy_requires_explicit_deployment_point(self):
         parser = MODULE.get_parser()
         args = parser.parse_args(["--wav", "a.wav", "--checkpoint", "a.pt"])
@@ -547,6 +634,22 @@ class TestManifestAndTimestamps(unittest.TestCase):
                     {"completed": 2, "total": 2, "clips": 0, "misses": 2, "errors": 1},
                 ],
             )
+            for filename in (
+                "results.jsonl",
+                "summary.json",
+                "threshold_scan_summary.json",
+                "threshold_scan.csv",
+                "threshold_scan.png",
+            ):
+                self.assertTrue((args.output_dir / filename).is_file(), filename)
+            result_rows = [
+                json.loads(line)
+                for line in (args.output_dir / "results.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(result_rows), 4)
+            self.assertEqual(sum(bool(row["skipped"]) for row in result_rows), 2)
 
     def test_manifest_fail_fast_emits_error_progress_and_stops_display(self):
         class SpyProgress(MODULE.ConsoleProgress):

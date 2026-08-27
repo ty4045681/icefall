@@ -66,6 +66,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from kws_eval_artifacts import (  # noqa: E402
+    ARTIFACT_FILENAMES,
+    ArtifactError,
+    build_result_record as build_evaluation_result,
+    write_evaluation_artifacts,
+)
 from kws_feature_cache import (  # noqa: E402
     FbankFeatureCache,
     prepare_cached_fbank,
@@ -980,6 +986,16 @@ def _validate_resume(
                 run.get("status")
             )
         )
+    exposure_path = _run_relative_path(
+        run_dir, run.get("exposure_csv"), "exposure_csv"
+    )
+    expected_exposure_sha256 = run.get("exposure_csv_sha256")
+    if not isinstance(expected_exposure_sha256, str) or not expected_exposure_sha256:
+        raise EvaluationError("--resume run.json has no usable exposure_csv_sha256")
+    if _sha256(exposure_path) != expected_exposure_sha256:
+        raise EvaluationError(
+            "--resume exposure CSV content differs from the completed run"
+        )
     event_manifest = _run_relative_path(
         run_dir, run.get("event_manifest"), "event_manifest"
     )
@@ -994,6 +1010,7 @@ def _validate_resume(
         raise EvaluationError(
             "--resume event manifest content differs from the completed run"
         )
+    _exact_results_path_from_run(run_dir, run)
     return event_manifest
 
 
@@ -1031,9 +1048,16 @@ def run_sweep(args: argparse.Namespace) -> int:
     exposure_path = output_dir / "exposure.csv"
     inference_dir = output_dir / "inference"
     event_manifest = inference_dir / "manifest.csv"
+    inference_results_path = inference_dir / "results.jsonl"
     log_path = output_dir / "runner.log"
     run_path = output_dir / "run.json"
     report_dir = output_dir / "report"
+    evaluation_artifact_paths = tuple(
+        output_dir / name for name in ARTIFACT_FILENAMES
+    )
+    inference_artifact_paths = tuple(
+        inference_dir / name for name in ARTIFACT_FILENAMES
+    )
     protected_inputs = [
         manifest_path,
         decode_script,
@@ -1042,7 +1066,12 @@ def run_sweep(args: argparse.Namespace) -> int:
     ]
     _validate_managed_output_paths(
         output_dir=output_dir,
-        managed_files=(exposure_path, log_path, run_path),
+        managed_files=(
+            exposure_path,
+            log_path,
+            run_path,
+            *evaluation_artifact_paths,
+        ),
         managed_roots=(inference_dir, report_dir),
         protected_inputs=protected_inputs,
     )
@@ -1080,7 +1109,6 @@ def run_sweep(args: argparse.Namespace) -> int:
             duration_field=args.duration_field,
             assume_negative=args.assume_negative,
         )
-        _atomic_write_csv(exposure_path, EXPOSURE_FIELDS, exposure, overwrite=True)
         artifacts = build_report(output_dir, overwrite=True)
         run_record.update(
             {
@@ -1099,7 +1127,12 @@ def run_sweep(args: argparse.Namespace) -> int:
         return 0
 
     if args.overwrite:
-        for previous in (event_manifest, report_dir / "report.html"):
+        for previous in (
+            event_manifest,
+            report_dir / "report.html",
+            *evaluation_artifact_paths,
+            *inference_artifact_paths,
+        ):
             if previous.exists() or previous.is_symlink():
                 previous.unlink()
     _atomic_write_csv(
@@ -1232,6 +1265,70 @@ def run_sweep(args: argparse.Namespace) -> int:
             "streaming inference succeeded but did not create {}".format(event_manifest)
         )
 
+    if inference_results_path.is_symlink():
+        run_record.update(
+            {
+                "status": "failed",
+                "finished_at": _utc_now(),
+                "decoder_error": "inference results JSONL is a symlink",
+            }
+        )
+        _atomic_write_json(run_path, run_record, overwrite=True)
+        raise EvaluationError(
+            "inference results JSONL must not be a symlink: {}".format(
+                inference_results_path
+            )
+        )
+    exact_results_available = inference_results_path.is_file()
+    if not exact_results_available and decode_script == DEFAULT_DECODE_SCRIPT.resolve():
+        run_record.update(
+            {
+                "status": "failed",
+                "finished_at": _utc_now(),
+                "decoder_error": "default decoder did not create exact results JSONL",
+            }
+        )
+        _atomic_write_json(run_path, run_record, overwrite=True)
+        raise EvaluationError(
+            "streaming inference succeeded but did not create {}".format(
+                inference_results_path
+            )
+        )
+    if exact_results_available:
+        exposure_by_row = {
+            int(row["source_manifest_row"]): row for row in exposure
+        }
+        try:
+            _load_exact_results(
+                inference_results_path,
+                thresholds=thresholds,
+                exposure_by_row=exposure_by_row,
+                allow_missing_label=bool(args.assume_negative),
+            )
+        except EvaluationError as error:
+            run_record.update(
+                {
+                    "status": "failed",
+                    "finished_at": _utc_now(),
+                    "decoder_error": str(error),
+                }
+            )
+            _atomic_write_json(run_path, run_record, overwrite=True)
+            raise
+        run_record.update(
+            {
+                "inference_results_jsonl": _relative_to_run(
+                    inference_results_path, output_dir
+                ),
+                "inference_results_jsonl_sha256": _sha256(
+                    inference_results_path
+                ),
+                "observation_semantics": "exact_results_jsonl_v1",
+            }
+        )
+    else:
+        run_record["observation_semantics"] = "legacy_event_manifest_v1"
+
     run_record.update(
         {
             "status": "inference_complete",
@@ -1278,6 +1375,58 @@ def _run_relative_path(run_dir: Path, value: Any, description: str) -> Path:
     if not path.is_absolute():
         path = run_dir / path
     return path.resolve()
+
+
+def _exact_results_path_from_run(
+    run_dir: Path, run: Mapping[str, Any]
+) -> Optional[Path]:
+    value = run.get("inference_results_jsonl")
+    expected_sha256 = run.get("inference_results_jsonl_sha256")
+    semantics = run.get("observation_semantics")
+    if semantics not in (
+        None,
+        "exact_results_jsonl_v1",
+        "legacy_event_manifest_v1",
+    ):
+        raise EvaluationError(
+            "run.json has unsupported observation_semantics={!r}".format(semantics)
+        )
+    if value is None and expected_sha256 is None:
+        if semantics == "exact_results_jsonl_v1":
+            raise EvaluationError(
+                "run.json declares exact observations but has no results fingerprint"
+            )
+        return None
+    if semantics == "legacy_event_manifest_v1":
+        raise EvaluationError(
+            "run.json declares legacy observations but also contains exact results"
+        )
+    if not value or not isinstance(expected_sha256, str) or not expected_sha256:
+        raise EvaluationError(
+            "run.json has an incomplete exact results path/fingerprint pair"
+        )
+    raw_path = Path(str(value)).expanduser()
+    if not raw_path.is_absolute():
+        raw_path = run_dir / raw_path
+    if raw_path.is_symlink():
+        raise EvaluationError(
+            "exact results JSONL must not be a symlink: {}".format(raw_path)
+        )
+    path = raw_path.resolve()
+    expected_path = (run_dir / "inference" / "results.jsonl").resolve()
+    if path != expected_path:
+        raise EvaluationError(
+            "exact results JSONL must be {}: {}".format(expected_path, path)
+        )
+    if not path.is_file():
+        raise EvaluationError("exact results JSONL is missing: {}".format(path))
+    if _sha256(path) != expected_sha256:
+        raise EvaluationError(
+            "exact results JSONL content differs from the completed run: {}".format(
+                path
+            )
+        )
+    return path
 
 
 def _load_exposure(path: Path) -> List[Dict[str, Any]]:
@@ -1396,6 +1545,304 @@ def _load_hits(
     return dict(hits)
 
 
+def _strict_utf8_lines(path: Path) -> Iterable[Tuple[int, str]]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                yield line_number, line
+    except UnicodeDecodeError as error:
+        raise EvaluationError(
+            "exact results JSONL is not valid UTF-8: {}".format(path)
+        ) from error
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError("non-standard JSON constant {!r}".format(value))
+
+
+def _load_exact_results(
+    path: Path,
+    *,
+    thresholds: Sequence[str],
+    exposure_by_row: Mapping[int, Mapping[str, Any]],
+    allow_missing_label: bool = False,
+) -> Tuple[List[Dict[str, Any]], Dict[Tuple[str, int], List[float]]]:
+    """Validate and canonicalize streaming_kws exact-threshold observations."""
+    if not path.is_file():
+        raise EvaluationError("exact results JSONL is missing: {}".format(path))
+    requested = set(thresholds)
+    expected = {
+        (threshold, source_row)
+        for threshold in thresholds
+        for source_row in exposure_by_row
+    }
+    seen = set()
+    records: List[Dict[str, Any]] = []
+    hits: Dict[Tuple[str, int], List[float]] = {}
+    for line_number, line in _strict_utf8_lines(path):
+        try:
+            if not line.strip():
+                continue
+            try:
+                raw = json.loads(line, parse_constant=_reject_json_constant)
+            except (json.JSONDecodeError, ValueError) as error:
+                raise EvaluationError(
+                    "invalid exact results JSON at line {}: {}".format(
+                        line_number, error
+                    )
+                ) from error
+            if not isinstance(raw, dict):
+                raise EvaluationError(
+                    "exact results line {} is not a JSON object".format(
+                        line_number
+                    )
+                )
+            raw_source_row = raw.get("source_manifest_row")
+            if isinstance(raw_source_row, bool) or not isinstance(
+                raw_source_row, int
+            ):
+                raise EvaluationError(
+                    "exact results line {} has invalid source_manifest_row".format(
+                        line_number
+                    )
+                )
+            try:
+                source_row = raw_source_row
+                threshold = _format_threshold(
+                    _parse_decimal(raw["threshold"], "result threshold")
+                )
+            except (KeyError, TypeError, ValueError, EvaluationError) as error:
+                raise EvaluationError(
+                    "invalid exact result identity at line {}: {}".format(
+                        line_number, error
+                    )
+                ) from error
+            identity = (threshold, source_row)
+            if threshold not in requested:
+                raise EvaluationError(
+                    "exact results line {} has unrequested threshold {}".format(
+                        line_number, threshold
+                    )
+                )
+            if source_row not in exposure_by_row:
+                raise EvaluationError(
+                    "exact results line {} references unknown source row {}".format(
+                        line_number, source_row
+                    )
+                )
+            if identity in seen:
+                raise EvaluationError(
+                    "duplicate exact result for threshold {} and source row {}".format(
+                        threshold, source_row
+                    )
+                )
+            seen.add(identity)
+            exposure = exposure_by_row[source_row]
+            if str(raw.get("keyword", "")).strip() != str(exposure["keyword"]):
+                raise EvaluationError(
+                    "exact results line {} keyword does not match source row {}".format(
+                        line_number, source_row
+                    )
+                )
+            if str(raw.get("audio_path", "")) != str(exposure["audio_path"]):
+                raise EvaluationError(
+                    "exact results line {} audio_path does not match source "
+                    "row {}".format(line_number, source_row)
+                )
+            resolved_audio = raw.get("audio_path_resolved")
+            expected_audio = Path(
+                str(exposure["audio_path_resolved"])
+            ).expanduser().resolve()
+            if (
+                resolved_audio is None
+                or Path(str(resolved_audio)).expanduser().resolve()
+                != expected_audio
+            ):
+                raise EvaluationError(
+                    "exact results line {} resolved audio path does not match "
+                    "source row {}".format(line_number, source_row)
+                )
+            label = raw.get("label")
+            label_was_missing = label is None
+            if label_was_missing and allow_missing_label:
+                label = 0
+            elif isinstance(label, bool) or not isinstance(label, int):
+                raise EvaluationError(
+                    "exact results line {} has no usable negative label".format(
+                        line_number
+                    )
+                )
+            if label != 0:
+                raise EvaluationError(
+                    "exact results line {} is not negative".format(line_number)
+                )
+            skipped = raw.get("skipped")
+            if not isinstance(skipped, bool) or skipped or raw.get("error") not in (
+                None,
+                "",
+            ):
+                raise EvaluationError(
+                    "exact results line {} is skipped or failed".format(line_number)
+                )
+            detections = raw.get("detections")
+            if not isinstance(detections, list) or any(
+                not isinstance(event, dict) for event in detections
+            ):
+                raise EvaluationError(
+                    "exact results line {} has invalid detections".format(line_number)
+                )
+            canonical_detections = []
+            for event_index, event in enumerate(detections):
+                canonical_event = dict(event)
+                clip_value = canonical_event.get("clip_audio_path")
+                if clip_value not in (None, ""):
+                    clip_path = Path(str(clip_value))
+                    if not clip_path.is_absolute():
+                        clip_path = path.parent / clip_path
+                    resolved_clip = clip_path.resolve()
+                    try:
+                        resolved_clip.relative_to(path.parent.resolve())
+                    except ValueError as error:
+                        raise EvaluationError(
+                            "exact results line {} event {} clip path escapes "
+                            "the inference directory".format(
+                                line_number, event_index
+                            )
+                        ) from error
+                    recorded_resolved = canonical_event.get(
+                        "clip_audio_path_resolved"
+                    )
+                    if recorded_resolved not in (None, "") and Path(
+                        str(recorded_resolved)
+                    ).expanduser().resolve() != resolved_clip:
+                        raise EvaluationError(
+                            "exact results line {} event {} clip paths disagree".format(
+                                line_number, event_index
+                            )
+                        )
+                    canonical_event["clip_audio_path"] = Path(
+                        os.path.relpath(str(resolved_clip), str(path.parent.parent))
+                    ).as_posix()
+                    canonical_event["clip_audio_path_resolved"] = str(
+                        resolved_clip
+                    )
+                canonical_detections.append(canonical_event)
+            detections = canonical_detections
+            detection_count = raw.get("detection_count")
+            if isinstance(detection_count, bool) or not isinstance(
+                detection_count, int
+            ):
+                raise EvaluationError(
+                    "exact results line {} has invalid detection_count".format(
+                        line_number
+                    )
+                )
+            if detection_count != len(detections):
+                raise EvaluationError(
+                    "exact results line {} detection_count disagrees with "
+                    "events".format(line_number)
+                )
+            false_alarm_events = raw.get("false_alarm_events")
+            if (
+                false_alarm_events is None
+                and label_was_missing
+                and allow_missing_label
+            ):
+                false_alarm_events = detection_count
+            if isinstance(false_alarm_events, bool) or not isinstance(
+                false_alarm_events, int
+            ) or false_alarm_events != detection_count:
+                raise EvaluationError(
+                    "exact results line {} false_alarm_events disagrees with "
+                    "events".format(line_number)
+                )
+            detected = raw.get("detected")
+            if not isinstance(detected, bool) or detected != bool(detections):
+                raise EvaluationError(
+                    "exact results line {} detected disagrees with events".format(
+                        line_number
+                    )
+                )
+            scores = []
+            for event_index, event in enumerate(detections):
+                raw_score = event.get("score")
+                if isinstance(raw_score, bool) or not isinstance(
+                    raw_score, (int, float)
+                ):
+                    raise EvaluationError(
+                        "exact results line {} event {} has invalid score".format(
+                            line_number, event_index
+                        )
+                    )
+                score = float(raw_score)
+                if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+                    raise EvaluationError(
+                        "exact results line {} event {} score is out of range".format(
+                            line_number, event_index
+                        )
+                    )
+                scores.append(score)
+            raw_qbyt_score = raw.get("qbyt_score")
+            if isinstance(raw_qbyt_score, bool) or not isinstance(
+                raw_qbyt_score, (int, float)
+            ):
+                raise EvaluationError(
+                    "exact results line {} has invalid qbyt_score".format(line_number)
+                )
+            qbyt_score = float(raw_qbyt_score)
+            expected_score = max(scores) if scores else 0.0
+            if not math.isfinite(qbyt_score) or not math.isclose(
+                qbyt_score, expected_score, rel_tol=0.0, abs_tol=1e-12
+            ):
+                raise EvaluationError(
+                    "exact results line {} qbyt_score disagrees with events".format(
+                        line_number
+                    )
+                )
+            raw_manifest_meta = raw.get("manifest_meta", {})
+            if not isinstance(raw_manifest_meta, dict):
+                raise EvaluationError(
+                    "exact results line {} has invalid manifest_meta".format(
+                        line_number
+                    )
+                )
+            manifest_meta = dict(raw_manifest_meta)
+            manifest_meta["category"] = str(exposure["category"])
+            records.append(
+                build_evaluation_result(
+                    source_manifest_row=source_row,
+                    audio_path=str(exposure["audio_path"]),
+                    audio_path_resolved=str(exposure["audio_path_resolved"]),
+                    keyword=str(exposure["keyword"]),
+                    label=0,
+                    threshold=threshold,
+                    events=detections,
+                    duration_sec=float(exposure["duration_sec"]),
+                    manifest_meta=manifest_meta,
+                )
+            )
+            hits[identity] = scores
+        except ArtifactError as error:
+            raise EvaluationError(
+                "invalid exact result at line {}: {}".format(line_number, error)
+            ) from error
+    if seen != expected:
+        missing = sorted(
+            expected.difference(seen),
+            key=lambda item: (item[1], float(item[0])),
+        )
+        preview = ", ".join(
+            "threshold {} / row {}".format(threshold, source_row)
+            for threshold, source_row in missing[:5]
+        )
+        raise EvaluationError(
+            "exact results are missing {} threshold/trial observation(s): {}".format(
+                len(missing), preview
+            )
+        )
+    return records, hits
+
+
 def _source_metrics(
     thresholds: Sequence[str],
     exposure: Sequence[Mapping[str, Any]],
@@ -1421,6 +1868,39 @@ def _source_metrics(
                 }
             )
     return rows
+
+
+def _standard_evaluation_records(
+    source_rows: Sequence[Mapping[str, Any]],
+    hits: Mapping[Tuple[str, int], Sequence[float]],
+) -> List[Dict[str, Any]]:
+    """Adapt exact threshold/trial observations to the shared JSONL schema."""
+    records = []
+    for row in source_rows:
+        threshold = str(row["threshold"])
+        source_row = int(row["source_manifest_row"])
+        scores = list(hits.get((threshold, source_row), ()))
+        records.append(
+            build_evaluation_result(
+                source_manifest_row=source_row,
+                audio_path=str(row["audio_path"]),
+                audio_path_resolved=str(row["audio_path_resolved"]),
+                keyword=str(row["keyword"]),
+                label=0,
+                threshold=threshold,
+                events=[
+                    {
+                        "score": float(score),
+                        "event_index": index,
+                        "clip_exported": True,
+                    }
+                    for index, score in enumerate(scores)
+                ],
+                duration_sec=float(row["duration_sec"]),
+                manifest_meta={"category": str(row["category"])},
+            )
+        )
+    return records
 
 
 def _threshold_metrics(
@@ -1766,10 +2246,25 @@ def build_report(run_dir: Path, overwrite: bool) -> Dict[str, Any]:
         )
     exposure = _load_exposure(exposure_path)
     exposure_by_row = {int(row["source_manifest_row"]): row for row in exposure}
-    hits = _load_hits(
+    exported_hits = _load_hits(
         event_path, thresholds=thresholds, exposure_by_row=exposure_by_row
     )
+    exact_results_path = _exact_results_path_from_run(run_dir, run)
+    if exact_results_path is None:
+        hits = exported_hits
+        standard_records: List[Dict[str, Any]] = []
+        observation_semantics = "legacy_event_manifest_v1"
+    else:
+        standard_records, hits = _load_exact_results(
+            exact_results_path,
+            thresholds=thresholds,
+            exposure_by_row=exposure_by_row,
+            allow_missing_label=bool(run.get("assume_negative", False)),
+        )
+        observation_semantics = "exact_results_jsonl_v1"
     source_rows = _source_metrics(thresholds, exposure, hits)
+    if exact_results_path is None:
+        standard_records = _standard_evaluation_records(source_rows, hits)
     summary_rows = _threshold_metrics(thresholds, source_rows)
     warnings = _nonmonotonic_warnings(summary_rows, "fa_per_hour")
     warnings.extend(_nonmonotonic_warnings(summary_rows, "source_trial_trigger_rate"))
@@ -1785,6 +2280,28 @@ def build_report(run_dir: Path, overwrite: bool) -> Dict[str, Any]:
     )
     _atomic_write_csv(
         threshold_path, THRESHOLD_METRIC_FIELDS, summary_rows, overwrite=overwrite
+    )
+
+    standard_artifacts = write_evaluation_artifacts(
+        output_dir=run_dir,
+        records=standard_records,
+        thresholds=thresholds,
+        manifest_path=Path(str(run.get("manifest", ""))),
+        overwrite=overwrite,
+        mode="musan",
+        summary_metadata={
+            name: run[name]
+            for name in (
+                "decode_script",
+                "decode_script_sha256",
+                "decoder_args",
+                "decoder_input_fingerprint",
+                "manifest_sha256",
+                "inference_results_jsonl",
+                "inference_results_jsonl_sha256",
+            )
+            if run.get(name) is not None
+        },
     )
 
     charts = []
@@ -1822,13 +2339,21 @@ def build_report(run_dir: Path, overwrite: bool) -> Dict[str, Any]:
             "false_alarm_events": "all detected events; multiple events per trial count",
             "triggered_source_trials": "trials with one or more events; each trial counts once",
             "fa_per_hour": "false_alarm_events / summed source-trial exposure hours",
+            "observation_source": observation_semantics,
         },
         "thresholds": thresholds,
         "source_trials": len(exposure),
         "event_count": sum(len(scores) for scores in hits.values()),
+        "exported_clip_event_count": sum(
+            len(scores) for scores in exported_hits.values()
+        ),
         "warnings": warnings,
         "metrics": summary_rows,
         "charts": charts,
+        "standard_artifacts": {
+            name: _relative_to_run(Path(path), run_dir)
+            for name, path in standard_artifacts.items()
+        },
     }
     _atomic_write_json(summary_path, summary, overwrite=overwrite)
     _atomic_write_text(
@@ -1841,7 +2366,7 @@ def build_report(run_dir: Path, overwrite: bool) -> Dict[str, Any]:
         ),
         overwrite=overwrite,
     )
-    return {
+    artifacts = {
         "source_metrics_csv": _relative_to_run(source_path, run_dir),
         "threshold_metrics_csv": _relative_to_run(threshold_path, run_dir),
         "summary_json": _relative_to_run(summary_path, run_dir),
@@ -1850,11 +2375,39 @@ def build_report(run_dir: Path, overwrite: bool) -> Dict[str, Any]:
             _relative_to_run(report_dir / chart["path"], run_dir) for chart in charts
         ],
     }
+    artifacts.update(
+        {
+            "results_jsonl": _relative_to_run(
+                Path(standard_artifacts["results.jsonl"]), run_dir
+            ),
+            "standard_summary_json": _relative_to_run(
+                Path(standard_artifacts["summary.json"]), run_dir
+            ),
+            "threshold_scan_summary_json": _relative_to_run(
+                Path(standard_artifacts["threshold_scan_summary.json"]), run_dir
+            ),
+            "threshold_scan_csv": _relative_to_run(
+                Path(standard_artifacts["threshold_scan.csv"]), run_dir
+            ),
+            "threshold_scan_png": _relative_to_run(
+                Path(standard_artifacts["threshold_scan.png"]), run_dir
+            ),
+        }
+    )
+    return artifacts
 
 
 def run_report(args: argparse.Namespace) -> int:
     run_dir = args.run_dir.expanduser().resolve()
     artifacts = build_report(run_dir, overwrite=args.overwrite)
+    run_path = run_dir / "run.json"
+    run = _load_run(run_dir)
+    run["artifacts"] = artifacts
+    run["report_rebuilt_at"] = _utc_now()
+    if run.get("status") == "inference_complete":
+        run["status"] = "complete"
+        run["finished_at"] = _utc_now()
+    _atomic_write_json(run_path, run, overwrite=True)
     print("Rebuilt report: {}".format(run_dir / artifacts["report_html"]))
     return 0
 

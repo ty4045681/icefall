@@ -183,6 +183,39 @@ reset 它自己的 decoder/context state，后续 beam 路径和命中时间已�
 `keywords_threshold`。多阈值模式的 WAV 文件名包含 `_thr_<threshold>`，
 因此即使不同阈值得到相同的 sample 边界，也不会互相覆盖。
 
+manifest 模式还会在 `--output-dir` 根目录写出统一评估产物：
+
+```text
+results.jsonl
+summary.json
+threshold_scan_summary.json
+threshold_scan.csv
+threshold_scan.png
+```
+
+`results.jsonl` 每行对应一个“实际阈值 × 输入 manifest trial”，因此零命中、
+跳过和错误 trial 也有记录；核心字段与 dma-kws Stage II 评估一致，包括
+`audio_path,keyword,label,qbyt_score,detected,threshold,skipped`，并增加
+`source_manifest_row,detection_count,detections,duration_sec,manifest_meta`。
+这里的 `qbyt_score` 为该阈值实际输出事件的最高关键词声学分数，零命中时为
+`0`；`detected` 才是权威判断，不能再次用 `qbyt_score >= threshold` 推导。
+事件中的 `clip_audio_path` 始终相对 `results.jsonl` 所在目录；若自定义
+`--output-manifest` 位于其他目录，另存的 `clip_manifest_audio_path` 保留 CSV
+中的原始相对值，`clip_audio_path_resolved` 提供绝对路径。
+
+`threshold_scan.csv` 按阈值降序。普通正/负样本保留
+`threshold,tp,tn,fp,fn,accuracy,precision,recall,f1,fpr,fnr,youden_j`，
+并追加可用/标注样本数和 detection rate；纯负且有时长的 manifest 自动使用
+负样本格式，明确列出 `false_alarm_events`、`negative_exposure_hours`、
+`fa_per_hour`、`fa_per_1000_hours`。其中 FP/TN 按 trial 是否触发计数，而
+FA/h 的分子是全部命中事件数。
+`threshold_scan.png` 采用与 dma-kws 扫描脚本一致的 threshold step 曲线：
+纯正画 Recall，纯负画 FPR，混合数据同时画 Recall 和 FPR。即使运行环境没有
+Matplotlib，也会用标准库后备渲染器生成 PNG。
+混合正负样本的 summary 使用 `sampled_auc`、`sampled_eer` 等命名：它们只在
+实际运行过的独立 decoder 阈值点上计算，不冒充可由统一 score ranking 得到的
+传统 ROC AUC/EER，也不会补造 `(0,0)` 或 `(1,1)` 端点。
+
 ## 纯负样本阈值评估
 
 `negative_kws_eval.py` 将负样本准备、可选的 Fbank 缓存、精确阈值
@@ -324,11 +357,21 @@ script 及参数指纹完全一致，且 inference 已成功完成时，复用�
 
 ```text
 /work/kws_eval/musan_sweep/
+├── results.jsonl
+├── summary.json
+├── threshold_scan_summary.json
+├── threshold_scan.csv
+├── threshold_scan.png
 ├── run.json
 ├── exposure.csv
 ├── runner.log
 ├── inference/
 │   ├── manifest.csv
+│   ├── results.jsonl
+│   ├── summary.json
+│   ├── threshold_scan_summary.json
+│   ├── threshold_scan.csv
+│   ├── threshold_scan.png
 │   └── wavs/
 └── report/
     ├── source_metrics.csv
@@ -341,6 +384,14 @@ script 及参数指纹完全一致，且 inference 已成功完成时，复用�
 
 - `run.json` 保存命令、输入/脚本指纹、阈值、状态和产物路径；
   `runner.log` 是 inference 子进程日志。
+- 根目录的五个统一评估产物与直接运行 `streaming_kws.py` 的契约相同；
+  `report/` 下的原有细分报表继续保留，便于按 keyword/category 查看。
+  默认 decoder 也会在 `inference/` 留下一份同批推理的中间评估产物。根目录
+  版本由 `negative_kws_eval.py report` 从受 SHA256 保护的
+  `inference/results.jsonl` 精确观测重建；`inference/manifest.csv` 只作为成功
+  导出片段的索引。因此越界而未导出 WAV 的 decoder 命中仍计入评估。
+  旧式替代 decoder 若不支持统一 JSONL，会在 `run.json` 中显式固定为 legacy
+  event-manifest 语义；后续 `report/--resume` 不会在精确观测损坏时静默降级。
 - `exposure.csv` 是标准化后的负样本试验及时长分母；
   `inference/manifest.csv` 是含 `keywords_threshold` 的合并命中表。
 - `source_metrics.csv` 每行对应“阈值 × 源 trial”，记录命中事件数、

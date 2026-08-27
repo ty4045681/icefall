@@ -65,7 +65,7 @@ class TestEvaluationArtifacts(unittest.TestCase):
                 thresholds=(0.2, 0.8),
                 manifest_path=Path("/dataset/manifest.csv"),
                 overwrite=False,
-                mode="musan",
+                negative_only=True,
             )
 
             self.assertEqual(set(paths), set(MODULE.ARTIFACT_FILENAMES))
@@ -89,8 +89,19 @@ class TestEvaluationArtifacts(unittest.TestCase):
                 if row["source_manifest_row"] == 2 and row["threshold"] == 0.2
             )
             self.assertEqual(low_first["detection_count"], 2)
-            self.assertEqual(low_first["qbyt_score"], 0.9)
             self.assertTrue(low_first["detected"])
+            self.assertEqual(
+                [event["score"] for event in low_first["detections"]],
+                [0.9, 0.8],
+            )
+            self.assertNotIn("qbyt_score", low_first)
+            self.assertNotIn("score_semantics", low_first)
+            self.assertTrue(
+                all(
+                    "qbyt_score" not in row and "score_semantics" not in row
+                    for row in result_rows
+                )
+            )
 
             curve = read_csv(output_dir / "threshold_scan.csv")
             self.assertEqual([row["threshold"] for row in curve], ["0.8", "0.2"])
@@ -103,6 +114,9 @@ class TestEvaluationArtifacts(unittest.TestCase):
             summary = json.loads(
                 (output_dir / "summary.json").read_text(encoding="utf-8")
             )
+            self.assertEqual(summary["schema_version"], 2)
+            self.assertEqual(summary["evaluation_type"], "negative")
+            self.assertNotIn("mode", summary)
             self.assertEqual(summary["num_samples"], 2)
             self.assertEqual(summary["num_result_rows"], 4)
             self.assertAlmostEqual(summary["total_hours"], 1.0)
@@ -111,12 +125,26 @@ class TestEvaluationArtifacts(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(scan["mode"], "musan")
+            self.assertEqual(scan["schema_version"], 2)
+            self.assertEqual(scan["evaluation_type"], "negative")
             self.assertEqual(scan["plot"]["metrics"], ["fpr"])
             self.assertEqual(
-                {value["name"] for value in scan["subsets"].values()},
+                {value["name"] for value in scan["categories"].values()},
                 {"music", "noise"},
             )
+            for removed in (
+                "mode",
+                "source_summary",
+                "score_min",
+                "score_max",
+                "threshold_step",
+                "workers",
+                "subsets",
+            ):
+                self.assertNotIn(removed, scan)
+            self.assertIn("category_music_fp", curve[0])
+            self.assertIn("category_noise_fp", curve[0])
+            self.assertFalse(any(name.startswith("subset_") for name in curve[0]))
 
     def test_generation_failure_does_not_replace_existing_artifact_set(self):
         record = self._record(
@@ -144,7 +172,7 @@ class TestEvaluationArtifacts(unittest.TestCase):
                     thresholds=(0.5,),
                     manifest_path=Path("/dataset/manifest.csv"),
                     overwrite=True,
-                    mode="musan",
+                    negative_only=True,
                 )
 
             self.assertEqual(
@@ -164,7 +192,7 @@ class TestEvaluationArtifacts(unittest.TestCase):
         )
         cases = (
             ("count", lambda row: row.update(detection_count=0)),
-            ("score", lambda row: row.update(qbyt_score=0.1)),
+            ("detected", lambda row: row.update(detected=False)),
             ("events", lambda row: row.update(false_alarm_events=0)),
             ("row", lambda row: row.update(source_manifest_row=True)),
         )
@@ -179,7 +207,7 @@ class TestEvaluationArtifacts(unittest.TestCase):
                         thresholds=(0.5,),
                         manifest_path=Path("/dataset/manifest.csv"),
                         overwrite=False,
-                        mode="musan",
+                        negative_only=True,
                     )
 
     def test_writer_rejects_empty_result_set(self):
@@ -209,12 +237,13 @@ class TestEvaluationArtifacts(unittest.TestCase):
                 thresholds=(0.2, 0.8),
                 manifest_path=Path("/dataset/manifest.csv"),
                 overwrite=False,
-                mode="clips",
+                negative_only=False,
             )
             curve = read_csv(output_dir / "threshold_scan.csv")
             self.assertEqual(
                 tuple(curve[0]),
-                MODULE.CLIP_SCAN_FIELDS + MODULE.CLIP_SCAN_EXTENSION_FIELDS,
+                MODULE.CLASSIFICATION_SCAN_FIELDS
+                + MODULE.CLASSIFICATION_SCAN_EXTENSION_FIELDS,
             )
             high, low = curve
             self.assertEqual(
@@ -230,6 +259,9 @@ class TestEvaluationArtifacts(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
+            self.assertEqual(scan["schema_version"], 2)
+            self.assertEqual(scan["evaluation_type"], "standard")
+            self.assertNotIn("mode", scan)
             self.assertEqual(scan["best_f1"]["threshold"], 0.8)
             self.assertEqual(scan["plot"]["metrics"], ["recall", "fpr"])
             for misleading_name in ("auc", "eer", "eer_threshold"):
@@ -253,12 +285,15 @@ class TestEvaluationArtifacts(unittest.TestCase):
                 thresholds=(0.5,),
                 manifest_path=Path("/dataset/manifest.csv"),
                 overwrite=False,
-                mode="clips",
+                negative_only=False,
             )
 
             summary = json.loads(
                 (output_dir / "summary.json").read_text(encoding="utf-8")
             )
+            self.assertEqual(summary["schema_version"], 2)
+            self.assertEqual(summary["evaluation_type"], "standard")
+            self.assertNotIn("mode", summary)
             self.assertNotIn("metrics", summary)
             self.assertNotIn("total_hours", summary)
             self.assertIn("detection_metrics", summary)
@@ -306,7 +341,7 @@ class TestEvaluationArtifacts(unittest.TestCase):
                     overwrite=False,
                 )
 
-    def test_auto_mode_does_not_drop_unlabeled_or_failed_positive_trials(self):
+    def test_auto_evaluation_does_not_drop_unlabeled_or_failed_positive_trials(self):
         negative = self._record(source_row=2, threshold=0.5, label=0)
         unlabeled = MODULE.build_result_record(
             source_manifest_row=3,
@@ -323,14 +358,14 @@ class TestEvaluationArtifacts(unittest.TestCase):
                 thresholds=(0.5,),
                 manifest_path=Path("/dataset/manifest.csv"),
                 overwrite=False,
-                mode="auto",
             )
             summary = json.loads(
                 (output_dir / "threshold_scan_summary.json").read_text(
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(summary["mode"], "clips")
+            self.assertEqual(summary["evaluation_type"], "standard")
+            self.assertNotIn("mode", summary)
             self.assertEqual(summary["num_unlabeled_excluded"], 1)
 
         failed_positive = MODULE.build_result_record(
@@ -351,15 +386,26 @@ class TestEvaluationArtifacts(unittest.TestCase):
                 thresholds=(0.5,),
                 manifest_path=Path("/dataset/manifest.csv"),
                 overwrite=False,
-                mode="auto",
             )
             summary = json.loads(
                 (output_dir / "threshold_scan_summary.json").read_text(
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(summary["mode"], "clips")
+            self.assertEqual(summary["evaluation_type"], "standard")
+            self.assertNotIn("mode", summary)
             self.assertEqual(summary["num_skipped_excluded"], 1)
+
+    def test_png_titles_use_generic_kws_branding(self):
+        cases = (
+            (("fpr",), "KWS False Positive Rate vs Keyword Threshold"),
+            (("recall", "fpr"), "KWS Recall and FPR vs Keyword Threshold"),
+        )
+        for metrics, expected in cases:
+            with self.subTest(metrics=metrics):
+                title = MODULE._plot_title(metrics)
+                self.assertEqual(title, expected)
+                self.assertNotIn("Stage II", title)
 
 
 if __name__ == "__main__":

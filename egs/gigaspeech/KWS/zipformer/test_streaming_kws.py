@@ -462,7 +462,9 @@ class TestManifestAndTimestamps(unittest.TestCase):
         )
         self.assertEqual(len(records), 1)
         self.assertTrue(records[0]["detected"])
-        self.assertEqual(records[0]["qbyt_score"], 0.9)
+        self.assertNotIn("qbyt_score", records[0])
+        self.assertNotIn("score_semantics", records[0])
+        self.assertEqual(records[0]["detections"][0]["score"], 0.9)
         self.assertFalse(records[0]["detections"][0]["clip_exported"])
         self.assertEqual(records[0]["detections"][0]["timestamp_frames"], [10, 11])
 
@@ -650,6 +652,24 @@ class TestManifestAndTimestamps(unittest.TestCase):
             ]
             self.assertEqual(len(result_rows), 4)
             self.assertEqual(sum(bool(row["skipped"]) for row in result_rows), 2)
+            self.assertTrue(
+                all(
+                    "qbyt_score" not in row and "score_semantics" not in row
+                    for row in result_rows
+                )
+            )
+            summary = json.loads(
+                (args.output_dir / "summary.json").read_text(encoding="utf-8")
+            )
+            scan = json.loads(
+                (args.output_dir / "threshold_scan_summary.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(summary["schema_version"], 2)
+            self.assertEqual(summary["evaluation_type"], "negative")
+            self.assertEqual(scan["schema_version"], 2)
+            self.assertEqual(scan["evaluation_type"], "negative")
 
     def test_manifest_fail_fast_emits_error_progress_and_stops_display(self):
         class SpyProgress(MODULE.ConsoleProgress):

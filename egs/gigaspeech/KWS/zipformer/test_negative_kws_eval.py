@@ -508,23 +508,25 @@ class TestOutputSafety(unittest.TestCase):
 
 
 class TestReport(unittest.TestCase):
-    def test_exact_results_accept_missing_label_only_for_assume_negative(self):
+    def test_legacy_v1_exact_results_normalize_only_for_assume_negative(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "results.jsonl"
-            write_jsonl(
-                path,
-                [
-                    MODULE.build_evaluation_result(
-                        source_manifest_row=2,
-                        audio_path="noise.wav",
-                        audio_path_resolved="/dataset/noise.wav",
-                        keyword="WAKE",
-                        threshold=0.5,
-                        events=[{"score": 0.8}],
-                        duration_sec=10.0,
-                    )
-                ],
+            legacy_v1_record = MODULE.build_evaluation_result(
+                source_manifest_row=2,
+                audio_path="noise.wav",
+                audio_path_resolved="/dataset/noise.wav",
+                keyword="WAKE",
+                threshold=0.5,
+                events=[{"score": 0.8}],
+                duration_sec=10.0,
             )
+            legacy_v1_record.update(
+                {
+                    "qbyt_score": 0.8,
+                    "score_semantics": "max_emitted_keyword_acoustic_score",
+                }
+            )
+            write_jsonl(path, [legacy_v1_record])
             exposure = {
                 2: {
                     "source_manifest_row": 2,
@@ -545,7 +547,7 @@ class TestReport(unittest.TestCase):
                     thresholds=("0.5",),
                     exposure_by_row=exposure,
                 )
-            records, hits = MODULE._load_exact_results(
+            records, hits, semantics = MODULE._load_exact_results(
                 path,
                 thresholds=("0.5",),
                 exposure_by_row=exposure,
@@ -554,7 +556,47 @@ class TestReport(unittest.TestCase):
 
             self.assertEqual(records[0]["label"], 0)
             self.assertEqual(records[0]["false_alarm_events"], 1)
+            self.assertNotIn("qbyt_score", records[0])
+            self.assertNotIn("score_semantics", records[0])
             self.assertEqual(hits[("0.5", 2)], [0.8])
+            self.assertEqual(semantics, "exact_results_jsonl_v1")
+
+    def test_exact_results_reject_mixed_v1_and_v2_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.jsonl"
+            records = [
+                MODULE.build_evaluation_result(
+                    source_manifest_row=2,
+                    audio_path="noise.wav",
+                    audio_path_resolved="/dataset/noise.wav",
+                    keyword="WAKE",
+                    label=0,
+                    threshold=threshold,
+                    events=[{"score": 0.8}],
+                    duration_sec=10.0,
+                )
+                for threshold in (0.2, 0.8)
+            ]
+            records[0]["qbyt_score"] = 0.8
+            write_jsonl(path, records)
+            exposure = {
+                2: {
+                    "source_manifest_row": 2,
+                    "audio_path": "noise.wav",
+                    "audio_path_resolved": "/dataset/noise.wav",
+                    "keyword": "WAKE",
+                    "label": "0",
+                    "category": "noise",
+                    "duration_sec": 10.0,
+                }
+            }
+
+            with self.assertRaisesRegex(MODULE.EvaluationError, "mix schema"):
+                MODULE._load_exact_results(
+                    path,
+                    thresholds=("0.2", "0.8"),
+                    exposure_by_row=exposure,
+                )
 
     def test_report_preserves_zero_hits_and_counts_events_and_trials(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -751,6 +793,10 @@ class TestReport(unittest.TestCase):
             )
             self.assertEqual(summary["event_count"], 3)
             self.assertEqual(summary["source_trials"], 2)
+            self.assertEqual(
+                summary["semantics"]["observation_source"],
+                "exact_results_jsonl_v2",
+            )
             for filename in (
                 "results.jsonl",
                 "summary.json",
@@ -766,6 +812,12 @@ class TestReport(unittest.TestCase):
                 .splitlines()
             ]
             self.assertEqual(len(standard_results), 4)
+            self.assertTrue(
+                all(
+                    "qbyt_score" not in row and "score_semantics" not in row
+                    for row in standard_results
+                )
+            )
             low_music_result = next(
                 row
                 for row in standard_results
@@ -797,6 +849,37 @@ class TestReport(unittest.TestCase):
             self.assertEqual([row["threshold"] for row in scan_rows], ["0.8", "0.2"])
             self.assertEqual(int(scan_rows[1]["fp"]), 2)
             self.assertAlmostEqual(float(scan_rows[1]["fa_per_hour"]), 3.0)
+            self.assertIn("category_music_fp", scan_rows[0])
+            self.assertIn("category_noise_fp", scan_rows[0])
+            self.assertFalse(
+                any(name.startswith("subset_") for name in scan_rows[0])
+            )
+            standard_summary = json.loads(
+                (run_dir / "summary.json").read_text(encoding="utf-8")
+            )
+            scan_summary = json.loads(
+                (run_dir / "threshold_scan_summary.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(standard_summary["schema_version"], 2)
+            self.assertEqual(standard_summary["evaluation_type"], "negative")
+            self.assertEqual(scan_summary["schema_version"], 2)
+            self.assertEqual(scan_summary["evaluation_type"], "negative")
+            self.assertEqual(
+                {value["name"] for value in scan_summary["categories"].values()},
+                {"music", "noise"},
+            )
+            for removed in (
+                "mode",
+                "source_summary",
+                "score_min",
+                "score_max",
+                "threshold_step",
+                "workers",
+                "subsets",
+            ):
+                self.assertNotIn(removed, scan_summary)
             self.assertEqual(
                 (run_dir / "threshold_scan.png").read_bytes()[:8],
                 b"\x89PNG\r\n\x1a\n",
@@ -963,6 +1046,30 @@ with output.open("w", encoding="utf-8", newline="") as handle:
                 "threshold_scan.png",
             ):
                 self.assertTrue((output_dir / filename).is_file(), filename)
+            standard_results = [
+                json.loads(line)
+                for line in (output_dir / "results.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertTrue(
+                all(
+                    "qbyt_score" not in row and "score_semantics" not in row
+                    for row in standard_results
+                )
+            )
+            standard_summary = json.loads(
+                (output_dir / "summary.json").read_text(encoding="utf-8")
+            )
+            scan_summary = json.loads(
+                (output_dir / "threshold_scan_summary.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(standard_summary["schema_version"], 2)
+            self.assertEqual(standard_summary["evaluation_type"], "negative")
+            self.assertEqual(scan_summary["schema_version"], 2)
+            self.assertEqual(scan_summary["evaluation_type"], "negative")
 
             resume_args = sweep_args("--resume")
             resume_args.insert(resume_args.index("--"), "--no-progress")

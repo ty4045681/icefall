@@ -1299,7 +1299,7 @@ def run_sweep(args: argparse.Namespace) -> int:
             int(row["source_manifest_row"]): row for row in exposure
         }
         try:
-            _load_exact_results(
+            _, _, exact_results_semantics = _load_exact_results(
                 inference_results_path,
                 thresholds=thresholds,
                 exposure_by_row=exposure_by_row,
@@ -1323,7 +1323,7 @@ def run_sweep(args: argparse.Namespace) -> int:
                 "inference_results_jsonl_sha256": _sha256(
                     inference_results_path
                 ),
-                "observation_semantics": "exact_results_jsonl_v1",
+                "observation_semantics": exact_results_semantics,
             }
         )
     else:
@@ -1386,13 +1386,14 @@ def _exact_results_path_from_run(
     if semantics not in (
         None,
         "exact_results_jsonl_v1",
+        "exact_results_jsonl_v2",
         "legacy_event_manifest_v1",
     ):
         raise EvaluationError(
             "run.json has unsupported observation_semantics={!r}".format(semantics)
         )
     if value is None and expected_sha256 is None:
-        if semantics == "exact_results_jsonl_v1":
+        if semantics in ("exact_results_jsonl_v1", "exact_results_jsonl_v2"):
             raise EvaluationError(
                 "run.json declares exact observations but has no results fingerprint"
             )
@@ -1566,7 +1567,11 @@ def _load_exact_results(
     thresholds: Sequence[str],
     exposure_by_row: Mapping[int, Mapping[str, Any]],
     allow_missing_label: bool = False,
-) -> Tuple[List[Dict[str, Any]], Dict[Tuple[str, int], List[float]]]:
+) -> Tuple[
+    List[Dict[str, Any]],
+    Dict[Tuple[str, int], List[float]],
+    str,
+]:
     """Validate and canonicalize streaming_kws exact-threshold observations."""
     if not path.is_file():
         raise EvaluationError("exact results JSONL is missing: {}".format(path))
@@ -1579,6 +1584,7 @@ def _load_exact_results(
     seen = set()
     records: List[Dict[str, Any]] = []
     hits: Dict[Tuple[str, int], List[float]] = {}
+    legacy_score_present: Optional[bool] = None
     for line_number, line in _strict_utf8_lines(path):
         try:
             if not line.strip():
@@ -1596,6 +1602,14 @@ def _load_exact_results(
                     "exact results line {} is not a JSON object".format(
                         line_number
                     )
+                )
+            row_has_legacy_score = "qbyt_score" in raw
+            if legacy_score_present is None:
+                legacy_score_present = row_has_legacy_score
+            elif legacy_score_present != row_has_legacy_score:
+                raise EvaluationError(
+                    "exact results mix schema-v1 and schema-v2 rows at line "
+                    "{}".format(line_number)
                 )
             raw_source_row = raw.get("source_manifest_row")
             if isinstance(raw_source_row, bool) or not isinstance(
@@ -1782,23 +1796,30 @@ def _load_exact_results(
                         )
                     )
                 scores.append(score)
-            raw_qbyt_score = raw.get("qbyt_score")
-            if isinstance(raw_qbyt_score, bool) or not isinstance(
-                raw_qbyt_score, (int, float)
-            ):
-                raise EvaluationError(
-                    "exact results line {} has invalid qbyt_score".format(line_number)
-                )
-            qbyt_score = float(raw_qbyt_score)
-            expected_score = max(scores) if scores else 0.0
-            if not math.isfinite(qbyt_score) or not math.isclose(
-                qbyt_score, expected_score, rel_tol=0.0, abs_tol=1e-12
-            ):
-                raise EvaluationError(
-                    "exact results line {} qbyt_score disagrees with events".format(
-                        line_number
+            # Schema v1 included a DMA-KWS aggregate score. Accept and validate
+            # it when reading old runs, but canonical schema-v2 records retain
+            # only the native Icefall scores in detections[*].score.
+            if "qbyt_score" in raw:
+                raw_qbyt_score = raw["qbyt_score"]
+                if isinstance(raw_qbyt_score, bool) or not isinstance(
+                    raw_qbyt_score, (int, float)
+                ):
+                    raise EvaluationError(
+                        "exact results line {} has invalid legacy aggregate "
+                        "score".format(line_number)
                     )
-                )
+                legacy_score = float(raw_qbyt_score)
+                expected_score = max(scores) if scores else 0.0
+                if not math.isfinite(legacy_score) or not math.isclose(
+                    legacy_score,
+                    expected_score,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                ):
+                    raise EvaluationError(
+                        "exact results line {} legacy aggregate score disagrees "
+                        "with events".format(line_number)
+                    )
             raw_manifest_meta = raw.get("manifest_meta", {})
             if not isinstance(raw_manifest_meta, dict):
                 raise EvaluationError(
@@ -1840,7 +1861,12 @@ def _load_exact_results(
                 len(missing), preview
             )
         )
-    return records, hits
+    semantics = (
+        "exact_results_jsonl_v1"
+        if legacy_score_present
+        else "exact_results_jsonl_v2"
+    )
+    return records, hits, semantics
 
 
 def _source_metrics(
@@ -2255,13 +2281,25 @@ def build_report(run_dir: Path, overwrite: bool) -> Dict[str, Any]:
         standard_records: List[Dict[str, Any]] = []
         observation_semantics = "legacy_event_manifest_v1"
     else:
-        standard_records, hits = _load_exact_results(
+        standard_records, hits, actual_observation_semantics = _load_exact_results(
             exact_results_path,
             thresholds=thresholds,
             exposure_by_row=exposure_by_row,
             allow_missing_label=bool(run.get("assume_negative", False)),
         )
-        observation_semantics = "exact_results_jsonl_v1"
+        declared_observation_semantics = run.get("observation_semantics")
+        if (
+            declared_observation_semantics is not None
+            and declared_observation_semantics != actual_observation_semantics
+        ):
+            raise EvaluationError(
+                "run.json observation_semantics={!r} disagrees with exact "
+                "results schema {!r}".format(
+                    declared_observation_semantics,
+                    actual_observation_semantics,
+                )
+            )
+        observation_semantics = actual_observation_semantics
     source_rows = _source_metrics(thresholds, exposure, hits)
     if exact_results_path is None:
         standard_records = _standard_evaluation_records(source_rows, hits)
@@ -2288,7 +2326,7 @@ def build_report(run_dir: Path, overwrite: bool) -> Dict[str, Any]:
         thresholds=thresholds,
         manifest_path=Path(str(run.get("manifest", ""))),
         overwrite=overwrite,
-        mode="musan",
+        negative_only=True,
         summary_metadata={
             name: run[name]
             for name in (

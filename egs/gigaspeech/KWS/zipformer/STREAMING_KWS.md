@@ -193,12 +193,18 @@ threshold_scan.csv
 threshold_scan.png
 ```
 
-`results.jsonl` 每行对应一个“实际阈值 × 输入 manifest trial”，因此零命中、
-跳过和错误 trial 也有记录；核心字段与 dma-kws Stage II 评估一致，包括
-`audio_path,keyword,label,qbyt_score,detected,threshold,skipped`，并增加
-`source_manifest_row,detection_count,detections,duration_sec,manifest_meta`。
-这里的 `qbyt_score` 为该阈值实际输出事件的最高关键词声学分数，零命中时为
-`0`；`detected` 才是权威判断，不能再次用 `qbyt_score >= threshold` 推导。
+这组产物使用 schema v2。`results.jsonl` 每行对应一个“实际阈值 × 输入
+manifest trial”，因此零命中、跳过和错误 trial 也有记录；字段包括
+`audio_path,keyword,label,detected,threshold,skipped` 以及
+`source_manifest_row,detection_count,detections,duration_sec` 和
+`manifest_meta`。事件分数保存在 `detections[].score`；顶层不再写
+`qbyt_score` 或 `score_semantics`。
+`detected` 是该独立阈值 decoder 的权威判断，不能再从某个汇总分数重新推导。
+
+`summary.json` 与 `threshold_scan_summary.json` 使用 `evaluation_type` 区分
+`standard`（常规正/负评估）和 `negative`（纯负时长评估），不再使用内部
+`mode` 名称。直接运行时会根据标签和有效时长自动选择；
+`negative_kws_eval.py` 的根目录报告明确生成 `negative` 评估。
 事件中的 `clip_audio_path` 始终相对 `results.jsonl` 所在目录；若自定义
 `--output-manifest` 位于其他目录，另存的 `clip_manifest_audio_path` 保留 CSV
 中的原始相对值，`clip_audio_path_resolved` 提供绝对路径。
@@ -208,10 +214,12 @@ threshold_scan.png
 并追加可用/标注样本数和 detection rate；纯负且有时长的 manifest 自动使用
 负样本格式，明确列出 `false_alarm_events`、`negative_exposure_hours`、
 `fa_per_hour`、`fa_per_1000_hours`。其中 FP/TN 按 trial 是否触发计数，而
-FA/h 的分子是全部命中事件数。
-`threshold_scan.png` 采用与 dma-kws 扫描脚本一致的 threshold step 曲线：
-纯正画 Recall，纯负画 FPR，混合数据同时画 Recall 和 FPR。即使运行环境没有
-Matplotlib，也会用标准库后备渲染器生成 PNG。
+FA/h 的分子是全部命中事件数。分类指标列使用
+`category_<slug>_*`，对应的机器可读元数据位于
+`threshold_scan_summary.json` 的 `categories`。
+`threshold_scan.png` 按实际运行过的 decoder threshold 绘制 step 曲线：纯正画
+Recall，纯负画 FPR，混合数据同时画 Recall 和 FPR。即使运行环境没有
+Matplotlib，也会用标准库后备渲染器生成 PNG；图标题只使用通用 KWS 指标名称。
 混合正负样本的 summary 使用 `sampled_auc`、`sampled_eer` 等命名：它们只在
 实际运行过的独立 decoder 阈值点上计算，不冒充可由统一 score ranking 得到的
 传统 ROC AUC/EER，也不会补造 `(0,0)` 或 `(1,1)` 端点。

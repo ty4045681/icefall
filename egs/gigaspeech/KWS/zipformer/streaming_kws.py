@@ -3145,7 +3145,6 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
         thresholds=thresholds,
         manifest_path=input_manifest,
         overwrite=args.overwrite,
-        mode="auto",
         summary_metadata=_evaluation_provenance(
             args,
             runtime,

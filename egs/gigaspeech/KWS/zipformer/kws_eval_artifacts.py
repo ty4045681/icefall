@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 RESULTS_FILENAME = "results.jsonl"
 SUMMARY_FILENAME = "summary.json"
 THRESHOLD_SCAN_SUMMARY_FILENAME = "threshold_scan_summary.json"
@@ -56,7 +56,7 @@ ARTIFACT_FILENAMES = (
     THRESHOLD_SCAN_PNG_FILENAME,
 )
 
-CLIP_SCAN_FIELDS = (
+CLASSIFICATION_SCAN_FIELDS = (
     "threshold",
     "tp",
     "tn",
@@ -70,7 +70,7 @@ CLIP_SCAN_FIELDS = (
     "fnr",
     "youden_j",
 )
-MUSAN_SCAN_FIELDS = (
+NEGATIVE_SCAN_FIELDS = (
     "threshold",
     "fp",
     "tn",
@@ -80,7 +80,7 @@ MUSAN_SCAN_FIELDS = (
     "fa_per_hour",
     "fa_per_1000_hours",
 )
-CLIP_SCAN_EXTENSION_FIELDS = (
+CLASSIFICATION_SCAN_EXTENSION_FIELDS = (
     "num_labeled",
     "num_usable",
     "detection_rate",
@@ -150,10 +150,9 @@ def build_result_record(
 ) -> Dict[str, Any]:
     """Build one strict result for an actually decoded threshold/trial pair.
 
-    ``qbyt_score`` is retained for compatibility with the referenced DMA-KWS
-    result schema.  Here it means the maximum emitted keyword acoustic score
-    at this exact decoder threshold, or zero when no event was emitted.
-    ``detected`` is authoritative; consumers must not re-threshold the score.
+    Each emitted event keeps its native Icefall decoder score in
+    ``detections[*].score``. ``detected`` is authoritative; consumers must not
+    re-threshold event scores because every row is an exact decoder run.
     """
     if isinstance(source_manifest_row, bool) or not isinstance(
         source_manifest_row, int
@@ -186,7 +185,6 @@ def build_result_record(
             raise ArtifactError("duration_sec must be positive")
 
     normalized_events: List[Dict[str, Any]] = []
-    scores: List[float] = []
     for index, raw_event in enumerate(events):
         if not isinstance(raw_event, Mapping):
             raise ArtifactError("event {} must be an object".format(index))
@@ -206,18 +204,15 @@ def build_result_record(
                 "event {} must be JSON serializable: {}".format(index, exc)
             ) from exc
         normalized_events.append(event)
-        scores.append(score)
 
     record: Dict[str, Any] = {
         "audio_path": audio_path,
         "keyword": keyword,
-        "qbyt_score": max(scores) if scores else 0.0,
         "detected": bool(normalized_events),
         "threshold": threshold_number,
         "skipped": bool(skipped),
         "source_manifest_row": row_number,
         "detection_count": len(normalized_events),
-        "score_semantics": "max_emitted_keyword_acoustic_score",
         "detections": normalized_events,
     }
     if label is not None:
@@ -376,41 +371,43 @@ def _category_name(record: Mapping[str, Any]) -> Optional[str]:
         return str(direct).strip()
     metadata = record.get("manifest_meta")
     if isinstance(metadata, Mapping):
-        value = metadata.get("category", metadata.get("subset"))
+        value = metadata.get("category")
         if value is not None and str(value).strip():
             return str(value).strip()
     return None
 
 
-def _add_subset_metrics(
+def _add_category_metrics(
     metric_row: Dict[str, Any],
     records: Sequence[Mapping[str, Any]],
     slugs: Mapping[str, str],
 ) -> None:
     for slug, category in sorted(slugs.items()):
-        subset = [
+        category_records = [
             row
             for row in records
             if not bool(row.get("skipped", False))
             and row.get("label") == 0
             and _category_name(row) == category
         ]
-        fp = sum(bool(row.get("detected", False)) for row in subset)
-        tn = len(subset) - fp
-        event_count = sum(int(row.get("detection_count", 0)) for row in subset)
+        fp = sum(bool(row.get("detected", False)) for row in category_records)
+        tn = len(category_records) - fp
+        event_count = sum(
+            int(row.get("detection_count", 0)) for row in category_records
+        )
         duration_sec = sum(
             float(row["duration_sec"])
-            for row in subset
+            for row in category_records
             if row.get("duration_sec") is not None
         )
         hours = duration_sec / 3600.0
-        metric_row["subset_{}_fp".format(slug)] = fp
-        metric_row["subset_{}_tn".format(slug)] = tn
-        metric_row["subset_{}_fpr".format(slug)] = _safe_divide(fp, fp + tn)
-        metric_row["subset_{}_false_alarm_events".format(slug)] = event_count
-        metric_row["subset_{}_exposure_hours".format(slug)] = hours
+        metric_row["category_{}_fp".format(slug)] = fp
+        metric_row["category_{}_tn".format(slug)] = tn
+        metric_row["category_{}_fpr".format(slug)] = _safe_divide(fp, fp + tn)
+        metric_row["category_{}_false_alarm_events".format(slug)] = event_count
+        metric_row["category_{}_exposure_hours".format(slug)] = hours
         if hours:
-            metric_row["subset_{}_fa_per_hour".format(slug)] = _safe_divide(
+            metric_row["category_{}_fa_per_hour".format(slug)] = _safe_divide(
                 event_count, hours
             )
 
@@ -604,6 +601,21 @@ class _RasterPlot:
         )
 
 
+_PLOT_METRIC_LABELS = {
+    "recall": "Recall",
+    "fpr": "False Positive Rate",
+    "detection_rate": "Detection Rate",
+}
+
+
+def _plot_title(metrics: Sequence[str]) -> str:
+    if len(metrics) == 1:
+        return "KWS {} vs Keyword Threshold".format(
+            _PLOT_METRIC_LABELS[metrics[0]]
+        )
+    return "KWS Recall and FPR vs Keyword Threshold"
+
+
 def _fallback_plot_png(
     rows: Sequence[Mapping[str, Any]], metrics: Sequence[str]
 ) -> bytes:
@@ -646,11 +658,7 @@ def _fallback_plot_png(
         raster.text(x - 25, top + plot_height + 20, format(threshold, ".2g"), scale=2)
 
     colors = ((31, 119, 180), (214, 39, 40), (44, 160, 44))
-    names = {
-        "recall": "RECALL",
-        "fpr": "FALSE POSITIVE RATE",
-        "detection_rate": "DETECTION RATE",
-    }
+    names = {name: label.upper() for name, label in _PLOT_METRIC_LABELS.items()}
     for metric_index, metric in enumerate(metrics):
         color = colors[metric_index % len(colors)]
         points = [
@@ -672,12 +680,9 @@ def _fallback_plot_png(
             scale=2,
         )
 
-    if len(metrics) == 1:
-        title = "STAGE II {} VS THRESHOLD".format(names[metrics[0]])
-    else:
-        title = "KWS RECALL AND FPR VS THRESHOLD"
+    title = _plot_title(metrics).upper()
     raster.text(max(20, width // 2 - len(title) * 9), 25, title, scale=3)
-    raster.text(width // 2 - 80, height - 55, "THRESHOLD", scale=3)
+    raster.text(width // 2 - 145, height - 55, "KEYWORD THRESHOLD", scale=3)
     return raster.png()
 
 
@@ -687,11 +692,6 @@ def _write_threshold_plot(
     metrics: Sequence[str],
     overwrite: bool,
 ) -> Dict[str, Any]:
-    metric_labels = {
-        "recall": "Recall",
-        "fpr": "False Positive Rate",
-        "detection_rate": "Detection Rate",
-    }
     try:
         import matplotlib
 
@@ -733,25 +733,25 @@ def _write_threshold_plot(
                 [float(row[metric]) for row in ordered],
                 where="pre",
                 linewidth=2.0,
-                label=metric_labels[metric] if len(metrics) > 1 else None,
+                label=(
+                    _PLOT_METRIC_LABELS[metric] if len(metrics) > 1 else None
+                ),
             )
         x_min, x_max = min(thresholds), max(thresholds)
         if x_min == x_max:
             x_min -= 0.05
             x_max += 0.05
         if len(metrics) == 1:
-            ylabel = metric_labels[metrics[0]]
-            title = "Stage II {} vs Threshold".format(ylabel)
+            ylabel = _PLOT_METRIC_LABELS[metrics[0]]
         else:
             ylabel = "Rate"
-            title = "KWS Recall and FPR vs Threshold"
             axis.legend()
         axis.set(
             xlim=(x_min, x_max),
             ylim=(0.0, 1.0),
-            xlabel="Threshold",
+            xlabel="Keyword Threshold",
             ylabel=ylabel,
-            title=title,
+            title=_plot_title(metrics),
         )
         axis.grid(True, alpha=0.25)
         figure.tight_layout()
@@ -787,10 +787,13 @@ def _normalize_records(
     seen = set()
     for index, raw in enumerate(records):
         row = dict(raw)
+        # Schema v1 copied these DMA-KWS compatibility fields into every row.
+        # Exact Icefall event scores are already present in ``detections``.
+        row.pop("qbyt_score", None)
+        row.pop("score_semantics", None)
         required = {
             "audio_path",
             "keyword",
-            "qbyt_score",
             "detected",
             "threshold",
             "skipped",
@@ -826,10 +829,6 @@ def _normalize_records(
                 )
             )
         seen.add(identity)
-        score = _finite_float(row["qbyt_score"], "qbyt_score")
-        if not 0.0 <= score <= 1.0:
-            raise ArtifactError("qbyt_score must be between 0 and 1")
-        row["qbyt_score"] = score
         if not isinstance(row["detected"], bool):
             raise ArtifactError("detected must be a boolean")
         if not isinstance(row["skipped"], bool):
@@ -858,7 +857,6 @@ def _normalize_records(
         row["detections"] = events
         if event_count != len(events):
             raise ArtifactError("detection_count must agree with detections")
-        event_scores = []
         for event_index, event in enumerate(events):
             if not isinstance(event, Mapping) or "score" not in event:
                 raise ArtifactError(
@@ -881,10 +879,6 @@ def _normalize_records(
                 raise ArtifactError(
                     "detection {} must be JSON serializable".format(event_index)
                 ) from error
-            event_scores.append(event_score)
-        expected_score = max(event_scores) if event_scores else 0.0
-        if not math.isclose(score, expected_score, rel_tol=0.0, abs_tol=1e-12):
-            raise ArtifactError("qbyt_score must equal the maximum detection score")
         if bool(row["detected"]) != bool(event_count):
             raise ArtifactError("detected must agree with detection_count")
         if row.get("label") == 0:
@@ -945,32 +939,36 @@ def _normalize_records(
     return normalized, threshold_keys
 
 
-def _infer_mode(records: Sequence[Mapping[str, Any]], requested: str) -> str:
-    if requested not in {"auto", "clips", "musan"}:
-        raise ArtifactError("mode must be auto, clips, or musan")
+def _resolve_negative_only(
+    records: Sequence[Mapping[str, Any]], requested: Optional[bool]
+) -> bool:
+    if requested is not None and not isinstance(requested, bool):
+        raise ArtifactError("negative_only must be true, false, or omitted")
     usable = [row for row in records if not bool(row.get("skipped", False))]
     labels = {
         int(row["label"])
         for row in usable
         if row.get("label") is not None
     }
-    if requested == "musan":
+    if requested is True:
         if not usable:
-            raise ArtifactError("musan mode requires at least one usable trial")
+            raise ArtifactError(
+                "negative evaluation requires at least one usable trial"
+            )
         if any(row.get("label") != 0 for row in records):
-            raise ArtifactError("musan mode requires negative-only labels")
+            raise ArtifactError("negative evaluation requires label 0 for every trial")
         if any(row.get("duration_sec") is None for row in usable):
-            raise ArtifactError("musan mode requires duration_sec for every trial")
-    if requested != "auto":
+            raise ArtifactError(
+                "negative evaluation requires duration_sec for every usable trial"
+            )
+    if requested is not None:
         return requested
-    if (
+    return bool(
         labels == {0}
         and usable
         and all(row.get("label") == 0 for row in records)
         and all(row.get("duration_sec") for row in usable)
-    ):
-        return "musan"
-    return "clips"
+    )
 
 
 def write_evaluation_artifacts(
@@ -980,14 +978,14 @@ def write_evaluation_artifacts(
     thresholds: Sequence[Any],
     manifest_path: Path,
     overwrite: bool,
-    mode: str = "auto",
+    negative_only: Optional[bool] = None,
     summary_metadata: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, str]:
     """Write the five standard KWS evaluation artifacts.
 
-    The PNG always exists on success.  Matplotlib reproduces the referenced
-    plotting style when installed; a small standard-library renderer preserves
-    the same step-curve layout when evaluation hosts omit plotting packages.
+    The PNG always exists on success. Matplotlib renders the KWS step curves
+    when installed; a small standard-library renderer preserves the same
+    layout when evaluation hosts omit plotting packages.
     All five outputs are fully staged before any existing artifact is replaced;
     each final file replacement is atomic.
     """
@@ -1022,7 +1020,8 @@ def write_evaluation_artifacts(
 
     normalized, threshold_keys = _normalize_records(records, thresholds)
     metadata = _json_ready_mapping(summary_metadata)
-    resolved_mode = _infer_mode(normalized, mode)
+    is_negative_only = _resolve_negative_only(normalized, negative_only)
+    evaluation_type = "negative" if is_negative_only else "standard"
     by_threshold: Dict[str, List[Mapping[str, Any]]] = {
         key: [] for key in threshold_keys
     }
@@ -1030,7 +1029,7 @@ def write_evaluation_artifacts(
         by_threshold[format_threshold(row["threshold"])].append(row)
 
     category_slugs: Dict[str, str] = {}
-    if resolved_mode == "musan":
+    if is_negative_only:
         categories = sorted(
             {
                 category
@@ -1047,22 +1046,24 @@ def write_evaluation_artifacts(
     for threshold_key in reversed(threshold_keys):
         row = _threshold_metrics(by_threshold[threshold_key])
         row["threshold"] = float(threshold_key)
-        if resolved_mode == "musan":
-            _add_subset_metrics(row, by_threshold[threshold_key], category_slugs)
+        if is_negative_only:
+            _add_category_metrics(row, by_threshold[threshold_key], category_slugs)
         metric_rows.append(row)
 
-    if resolved_mode == "clips":
-        csv_fields = list(CLIP_SCAN_FIELDS + CLIP_SCAN_EXTENSION_FIELDS)
+    if not is_negative_only:
+        csv_fields = list(
+            CLASSIFICATION_SCAN_FIELDS + CLASSIFICATION_SCAN_EXTENSION_FIELDS
+        )
     else:
-        csv_fields = list(MUSAN_SCAN_FIELDS)
+        csv_fields = list(NEGATIVE_SCAN_FIELDS)
         csv_fields.extend(
             sorted(
                 {
                     name
                     for row in metric_rows
                     for name in row
-                    if name.startswith("subset_")
-                    and name not in MUSAN_SCAN_FIELDS
+                    if name.startswith("category_")
+                    and name not in NEGATIVE_SCAN_FIELDS
                 }
             )
         )
@@ -1107,9 +1108,9 @@ def write_evaluation_artifacts(
     semantics = {
         "result_row": "one exact decoder threshold x input manifest trial",
         "detected": "one or more emitted keyword events at that exact threshold",
-        "qbyt_score": (
-            "maximum emitted mean keyword-token acoustic probability; zero for "
-            "no event; never re-threshold this field"
+        "event_score": (
+            "detections[*].score is the emitted Icefall keyword event score; "
+            "never re-threshold it to reconstruct another decoder run"
         ),
         "fp_tn": "triggered/non-triggered negative trials; at most one per trial",
         "false_alarm_events": "all emitted events; multiple events per trial count",
@@ -1135,17 +1136,17 @@ def write_evaluation_artifacts(
         "output_dir": str(output_dir),
         "num_skipped": len(skipped_trials),
         "thresholds": [float(value) for value in threshold_keys],
-        "mode": resolved_mode,
+        "evaluation_type": evaluation_type,
         "semantics": semantics,
         "artifacts": {name: str(path.resolve()) for name, path in paths.items()},
     }
-    if resolved_mode == "musan":
+    if is_negative_only:
         summary["total_hours"] = total_hours
     if len(metric_rows) == 1:
         if unique_labeled_trials:
             summary["metrics"] = {
                 name: metric_rows[0][name]
-                for name in CLIP_SCAN_FIELDS
+                for name in CLASSIFICATION_SCAN_FIELDS
                 if name in metric_rows[0]
             }
             summary["metrics"]["num_labeled"] = metric_rows[0]["num_labeled"]
@@ -1154,7 +1155,7 @@ def write_evaluation_artifacts(
                 name: metric_rows[0][name]
                 for name in ("threshold", "num_usable", "detection_rate")
             }
-        if resolved_mode == "musan" and "metrics" in summary:
+        if is_negative_only and "metrics" in summary:
             summary["metrics"].update(
                 {
                     "fa_per_hour": metric_rows[0]["fa_per_hour"],
@@ -1168,12 +1169,10 @@ def write_evaluation_artifacts(
     if metadata:
         summary["provenance"] = metadata
 
-    scores = [float(row["qbyt_score"]) for row in usable]
     scan_summary: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "results": str(paths[RESULTS_FILENAME].resolve()),
-        "source_summary": str(paths[SUMMARY_FILENAME].resolve()),
-        "mode": resolved_mode,
+        "evaluation_type": evaluation_type,
         "num_samples": len(usable_trial_ids),
         "num_input_rows": len(unique_trials),
         "num_result_rows": len(normalized),
@@ -1183,16 +1182,12 @@ def write_evaluation_artifacts(
         ),
         "positives": sum(value == 1 for value in unique_labeled_trials.values()),
         "negatives": sum(value == 0 for value in unique_labeled_trials.values()),
-        "score_min": min(scores) if scores else None,
-        "score_max": max(scores) if scores else None,
         "num_thresholds": len(threshold_keys),
-        "threshold_step": None,
-        "workers": 1,
         "curve_csv": str(paths[THRESHOLD_SCAN_CSV_FILENAME].resolve()),
         "semantics": semantics,
         "warnings": _nonmonotonic_warnings(metric_rows),
     }
-    if resolved_mode == "clips" and positives and negatives:
+    if not is_negative_only and positives and negatives:
         best_youden = _best_row(metric_rows, "youden_j", "f1")
         best_f1 = _best_row(metric_rows, "f1", "youden_j")
         eer_row = min(
@@ -1208,7 +1203,7 @@ def write_evaluation_artifacts(
                 "selection_scope": "sampled_exact_decoder_thresholds_only",
                 "sampled_auc": sampled_auc,
                 "sampled_auc_method": (
-                    "trapezoidal_observed_fpr_upper_envelope_no_endpoints"
+                    "trapezoidal_observed_points_duplicate_fpr_max_no_endpoints"
                 ),
                 "sampled_auc_fpr_span": sampled_auc_span,
                 "sampled_eer": (
@@ -1218,35 +1213,39 @@ def write_evaluation_artifacts(
                 "sampled_eer_threshold": float(eer_row["threshold"]),
                 "sampled_eer_method": "closest_sampled_operating_point",
                 "best_youden": {
-                    name: best_youden[name] for name in CLIP_SCAN_FIELDS
+                    name: best_youden[name]
+                    for name in CLASSIFICATION_SCAN_FIELDS
                 },
-                "best_f1": {name: best_f1[name] for name in CLIP_SCAN_FIELDS},
+                "best_f1": {
+                    name: best_f1[name]
+                    for name in CLASSIFICATION_SCAN_FIELDS
+                },
             }
         )
-    if resolved_mode == "musan":
-        subset_summary = {}
+    if is_negative_only:
+        category_summary = {}
         first_threshold_rows = (
             by_threshold[threshold_keys[0]] if threshold_keys else []
         )
         for slug, category in sorted(category_slugs.items()):
-            subset = [
+            category_records = [
                 row
                 for row in first_threshold_rows
                 if not bool(row.get("skipped", False))
                 and _category_name(row) == category
             ]
-            subset_summary[slug] = {
+            category_summary[slug] = {
                 "name": category,
-                "num_samples": len(subset),
+                "num_samples": len(category_records),
                 "total_hours": sum(
                     float(row["duration_sec"])
-                    for row in subset
+                    for row in category_records
                     if row.get("duration_sec") is not None
                 )
                 / 3600.0,
             }
         scan_summary["total_hours"] = total_hours
-        scan_summary["subsets"] = subset_summary
+        scan_summary["categories"] = category_summary
 
     output_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(

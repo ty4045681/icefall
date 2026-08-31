@@ -17,6 +17,8 @@ MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
 
+import kws_streaming_batch as BATCH_MODULE
+
 CONTEXT_GRAPH_SCRIPT = SCRIPT.parents[4] / "icefall" / "context_graph.py"
 CONTEXT_GRAPH_SPEC = importlib.util.spec_from_file_location(
     "streaming_kws_test_context_graph", CONTEXT_GRAPH_SCRIPT
@@ -1046,8 +1048,15 @@ class TestStatefulKeywordDecoder(unittest.TestCase):
             blank_id = 0
             context_size = 1
 
+            def __init__(self):
+                super().__init__()
+                self.forward_calls = 0
+                self.batch_sizes = []
+
             def forward(self, decoder_input, need_pad=False):
                 del need_pad
+                self.forward_calls += 1
+                self.batch_sizes.append(int(decoder_input.size(0)))
                 return torch.zeros(
                     decoder_input.size(0), 1, 4, device=decoder_input.device
                 )
@@ -1056,16 +1065,22 @@ class TestStatefulKeywordDecoder(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.encoder_proj_calls = 0
+                self.decoder_proj_calls = 0
+                self.forward_calls = 0
+                self.batch_sizes = []
 
             def encoder_proj(self, value):
                 self.encoder_proj_calls += 1
                 return value
 
             def decoder_proj(self, value):
+                self.decoder_proj_calls += 1
                 return value
 
             def forward(self, encoder, decoder, project_input=False):
                 del decoder, project_input
+                self.forward_calls += 1
+                self.batch_sizes.append(int(encoder.size(0)))
                 return encoder
 
         class Model(torch.nn.Module):
@@ -1522,6 +1537,191 @@ class TestStatefulKeywordDecoder(unittest.TestCase):
             high_graph.root,
         )
 
+    def test_batched_neural_calls_scale_with_frames_not_search_lanes(self):
+        model = self.Model().eval()
+        decoder_streams = []
+        for stream_index in range(2):
+            bank = MODULE.MultiThresholdKeywordDecoder(
+                model=model,
+                keywords_graphs={
+                    threshold: self.Graph(threshold)
+                    for threshold in (0.25, 0.5, 0.75)
+                },
+                beam=1,
+                num_tailing_blanks=0,
+                blank_penalty=0.0,
+            )
+            decoder_streams.extend(
+                (decoder, stream_index) for decoder in bank.decoders.values()
+            )
+        projected = torch.full((2, 4, 4), -8.0)
+        projected[:, :, 0] = 8.0
+
+        detections = MODULE._advance_stateful_keyword_decoders_batched(
+            model=model,
+            projected=projected,
+            decoder_streams=decoder_streams,
+            stream_valid_lens=[4, 4],
+        )
+
+        self.assertEqual(detections, [[] for _ in decoder_streams])
+        # Predictor projection is stateless and cached across frames; joiner
+        # still runs once for each valid encoder frame.
+        self.assertEqual(model.decoder.forward_calls, 1)
+        self.assertEqual(model.joiner.decoder_proj_calls, 1)
+        self.assertEqual(model.joiner.forward_calls, 4)
+        # Six search lanes collapse to one predictor history and two
+        # stream-specific joiner rows on every frame.
+        self.assertEqual(model.decoder.batch_sizes, [1])
+        self.assertEqual(model.joiner.batch_sizes, [2, 2, 2, 2])
+
+    def test_predictor_cache_is_disabled_in_training_mode(self):
+        model = self.Model()
+        decoder = MODULE.StatefulKeywordDecoder(
+            model=model,
+            keywords_graph=self.Graph(),
+            beam=1,
+            num_tailing_blanks=0,
+            blank_penalty=0.0,
+        )
+        cache = {(0,): torch.ones(1, 1, 4)}
+        projected = torch.full((1, 3, 4), -8.0)
+        projected[:, :, 0] = 8.0
+
+        MODULE._advance_stateful_keyword_decoders_batched(
+            model=model,
+            projected=projected,
+            decoder_streams=[(decoder, 0)],
+            stream_valid_lens=[3],
+            predictor_projection_cache=cache,
+        )
+
+        self.assertEqual(model.decoder.forward_calls, 3)
+        self.assertEqual(cache, {})
+
+    def test_predictor_cache_invalidates_an_incompatible_dtype(self):
+        model = self.Model().eval()
+        decoder = MODULE.StatefulKeywordDecoder(
+            model=model,
+            keywords_graph=self.Graph(),
+            beam=1,
+            num_tailing_blanks=0,
+            blank_penalty=0.0,
+        )
+        cache = {(0,): torch.zeros(1, 1, 4, dtype=torch.float64)}
+        projected = torch.full((1, 3, 4), -8.0)
+        projected[:, :, 0] = 8.0
+
+        with torch.inference_mode():
+            MODULE._advance_stateful_keyword_decoders_batched(
+                model=model,
+                projected=projected,
+                decoder_streams=[(decoder, 0)],
+                stream_valid_lens=[3],
+                predictor_projection_cache=cache,
+            )
+
+        self.assertEqual(model.decoder.forward_calls, 1)
+        self.assertEqual(cache[(0,)].dtype, torch.float32)
+
+    def test_batched_decoder_honors_heterogeneous_valid_lengths(self):
+        model = self.Model()
+        short = MODULE.StatefulKeywordDecoder(
+            model=model,
+            keywords_graph=self.Graph(),
+            beam=1,
+            num_tailing_blanks=0,
+            blank_penalty=0.0,
+        )
+        long = MODULE.StatefulKeywordDecoder(
+            model=model,
+            keywords_graph=self.Graph(),
+            beam=1,
+            num_tailing_blanks=0,
+            blank_penalty=0.0,
+        )
+        # The short stream's padded frames would form a hit if valid_lens were
+        # ignored.  The long stream should consume all three frames and hit.
+        projected = torch.cat(
+            [
+                torch.cat([self._frame(token) for token in (1, 2, 0)], dim=1),
+                torch.cat([self._frame(token) for token in (1, 2, 0)], dim=1),
+            ],
+            dim=0,
+        )
+
+        detections = MODULE._advance_stateful_keyword_decoders_batched(
+            model=model,
+            projected=projected,
+            decoder_streams=[(short, 0), (long, 1)],
+            stream_valid_lens=[1, 3],
+        )
+
+        self.assertEqual(detections[0], [])
+        self.assertEqual(len(detections[1]), 1)
+        self.assertEqual(detections[1][0].timestamp_frames, [0, 1])
+        self.assertEqual(short.frame_offset, 1)
+        self.assertEqual(long.frame_offset, 3)
+
+    def test_streaming_state_select_append_and_slice_follow_schema(self):
+        state_count = 14  # Two encoder layers plus embed cache and lengths.
+        states = []
+        for state_index in range(state_count):
+            batch_dim = BATCH_MODULE.state_batch_dim(state_index, state_count)
+            shape = [2, 3, 2] if batch_dim == 1 else [3, 2, 2]
+            value = torch.empty(shape)
+            for stream_index in range(3):
+                selection = [slice(None)] * value.ndim
+                selection[batch_dim] = stream_index
+                value[tuple(selection)] = 100 * state_index + stream_index
+            states.append(value)
+
+        selected = BATCH_MODULE.select_states(states, [2, 0])
+        fresh = []
+        for state_index, state in enumerate(states):
+            batch_dim = BATCH_MODULE.state_batch_dim(state_index, state_count)
+            shape = list(state.shape)
+            shape[batch_dim] = 1
+            fresh.append(torch.full(shape, -1.0))
+        combined = BATCH_MODULE.concat_states([selected, fresh])
+
+        self.assertEqual(BATCH_MODULE.state_batch_size(combined), 3)
+        for state_index, state in enumerate(combined):
+            batch_dim = BATCH_MODULE.state_batch_dim(state_index, state_count)
+            observed = []
+            for stream_index in range(3):
+                selection = [0] * state.ndim
+                selection[batch_dim] = stream_index
+                observed.append(float(state[tuple(selection)]))
+            self.assertEqual(
+                observed,
+                [100 * state_index + 2, 100 * state_index, -1.0],
+            )
+        sliced = BATCH_MODULE.slice_states(combined, 1, 3)
+        self.assertEqual(BATCH_MODULE.state_batch_size(sliced), 2)
+
+    def test_cpu_feature_stager_pads_and_reuses_double_buffer(self):
+        stager = MODULE._FeatureBatchStager(
+            max_batch_size=2,
+            segment_frames=4,
+            feature_dim=2,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            pad_value=-9.0,
+        )
+
+        first = stager.stage([torch.ones(2, 2), torch.full((4, 2), 3.0)]).clone()
+        second = stager.stage([torch.full((1, 2), 5.0)]).clone()
+        third = stager.stage([torch.full((3, 2), 7.0)]).clone()
+
+        self.assertEqual(tuple(first.shape), (2, 4, 2))
+        self.assertTrue(torch.equal(first[0, :2], torch.ones(2, 2)))
+        self.assertTrue(torch.equal(first[0, 2:], torch.full((2, 2), -9.0)))
+        self.assertTrue(torch.equal(first[1], torch.full((4, 2), 3.0)))
+        self.assertTrue(torch.equal(second[0, 0], torch.full((2,), 5.0)))
+        self.assertTrue(torch.equal(second[0, 1:], torch.full((3, 2), -9.0)))
+        self.assertTrue(torch.equal(third[0, :3], torch.full((3, 2), 7.0)))
+
     def test_streaming_state_stack_unstack_round_trip(self):
         def one_stream(value):
             return [
@@ -1536,7 +1736,7 @@ class TestStatefulKeywordDecoder(unittest.TestCase):
             ]
 
         original = [one_stream(1.0), one_stream(2.0)]
-        restored = MODULE.unstack_states(MODULE.stack_states(original))
+        restored = BATCH_MODULE.unstack_states(BATCH_MODULE.stack_states(original))
 
         self.assertEqual(len(restored), len(original))
         for expected_states, actual_states in zip(original, restored):
@@ -1734,6 +1934,86 @@ class TestStatefulKeywordDecoder(unittest.TestCase):
         self.assertEqual(observed_processed_lens, [[0, 0], [1, 0]])
         self.assertEqual(results["only-first"][0.5], [])
         self.assertEqual(results["only-second"][0.5], [])
+
+    def test_batched_refill_preserves_survivor_decoder_and_resets_new_slot(self):
+        model = self.Model()
+        runtime = SimpleNamespace(
+            model=model,
+            params=SimpleNamespace(chunk_size=16, left_context_frames=64),
+            decode_mode="streaming",
+            max_token_gap_sec=None,
+            max_keyword_duration_sec=None,
+        )
+        args = SimpleNamespace(
+            beam=1,
+            num_tailing_blanks=0,
+            blank_penalty=0.0,
+            tail_padding_sec=0.0,
+        )
+        observed_processed_lens = []
+
+        def fake_get_init_states(model, device, batch_size=1):
+            del model
+            return self._fake_streaming_states(batch_size, device)
+
+        def fake_streaming_forward(**kwargs):
+            feature_batch = kwargs["features"]
+            states = kwargs["states"]
+            observed_processed_lens.append(states[-1].tolist())
+            output = feature_batch[:, :, :4].clone()
+            padding = torch.isclose(
+                output,
+                torch.tensor(MODULE.LOG_EPS, device=output.device),
+            ).all(dim=-1)
+            output[padding] = torch.tensor(
+                [8.0, -8.0, -8.0, -8.0], device=output.device
+            )
+            new_states = [value.clone() for value in states]
+            new_states[-1] = states[-1] + 1
+            lengths = torch.full(
+                (output.size(0),),
+                output.size(1),
+                dtype=torch.int64,
+                device=output.device,
+            )
+            return output, lengths, new_states
+
+        survivor_tokens = [1] + [0] * 44 + [2, 0]
+        items = [
+            MODULE.KeywordBatchItem(
+                "short", self._token_features([0]), {0.5: self.Graph()}
+            ),
+            MODULE.KeywordBatchItem(
+                "survivor",
+                self._token_features(survivor_tokens),
+                {0.5: self.Graph()},
+            ),
+            MODULE.KeywordBatchItem(
+                "refill", self._token_features([2, 0]), {0.5: self.Graph()}
+            ),
+        ]
+        with mock.patch.object(
+            MODULE, "get_init_states", side_effect=fake_get_init_states
+        ), mock.patch.object(
+            MODULE, "streaming_forward", side_effect=fake_streaming_forward
+        ):
+            results = dict(
+                MODULE.run_keyword_inference_multi_threshold_batched(
+                    runtime=runtime,
+                    items=items,
+                    args=args,
+                    batch_size=2,
+                )
+            )
+
+        self.assertEqual(observed_processed_lens, [[0, 0], [1, 0]])
+        self.assertEqual(results["short"][0.5], [])
+        self.assertEqual(results["refill"][0.5], [])
+        self.assertEqual(len(results["survivor"][0.5]), 1)
+        self.assertEqual(
+            results["survivor"][0.5][0].timestamp_frames,
+            [0, 58],
+        )
 
     def test_cached_manifest_without_hits_never_reloads_waveform(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2001,6 +2281,214 @@ class TestStatefulKeywordDecoder(unittest.TestCase):
                     (4, "0.75"),
                 ],
             )
+
+    def test_batched_export_error_order_and_results_are_closed(self):
+        from threading import Event
+
+        class DecodeFailure(RuntimeError):
+            pass
+
+        class ExportFailure(RuntimeError):
+            pass
+
+        class ControlledFuture:
+            def __init__(self, function, args, kwargs, *, eager):
+                self.function = function
+                self.args = args
+                self.kwargs = kwargs
+                self.ran = False
+                self.cancelled = False
+                self.value = None
+                self.error = None
+                if eager:
+                    self._run()
+
+            def _run(self):
+                if self.ran or self.cancelled:
+                    return
+                self.ran = True
+                try:
+                    self.value = self.function(*self.args, **self.kwargs)
+                except BaseException as error:
+                    self.error = error
+
+            def done(self):
+                return self.ran
+
+            def result(self):
+                self._run()
+                if self.cancelled:
+                    raise RuntimeError("controlled future was cancelled")
+                if self.error is not None:
+                    raise self.error
+                return self.value
+
+            def cancel(self):
+                if self.ran:
+                    return False
+                self.cancelled = True
+                return True
+
+        scenarios = (
+            ("late-success", False, False, DecodeFailure),
+            ("late-export-error", False, True, ExportFailure),
+            ("eager-export-error", True, True, ExportFailure),
+        )
+        for name, export_eager, export_error, expected_error in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest = root / "input.csv"
+                manifest.touch()
+                audio = root / "audio.wav"
+                audio.write_bytes(b"source")
+                cache_dir = root / "features"
+                MODULE.FbankFeatureCache(cache_dir).store(
+                    audio,
+                    torch.zeros(3, 80),
+                    num_samples=1600,
+                )
+                entry = MODULE.ManifestEntry(
+                    row_number=2,
+                    row={"audio_path": audio.name, "keyword": "HEY EVA"},
+                    audio_path=audio,
+                    keyword="HEY EVA",
+                    label=0,
+                )
+                args = SimpleNamespace(
+                    manifest=manifest,
+                    output_dir=root / "output",
+                    output_manifest=None,
+                    wav_subdir="wavs",
+                    pre_roll_sec=0.0,
+                    post_roll_sec=0.0,
+                    overwrite=True,
+                    keywords_thresholds=None,
+                    keywords_threshold=None,
+                    progress=False,
+                    fail_fast=True,
+                    feature_cache_dir=cache_dir,
+                    stream_batch_size=2,
+                )
+                runtime = SimpleNamespace(
+                    model=self.Model(),
+                    params=SimpleNamespace(chunk_size=16, left_context_frames=64),
+                    sp=object(),
+                    keywords_score=1.5,
+                    keywords_threshold=0.5,
+                    decode_mode="streaming",
+                    max_token_gap_sec=None,
+                    max_keyword_duration_sec=None,
+                )
+                detection = MODULE.Detection("WAKE", [1, 2], 0.9)
+                export_finished = Event()
+                results_closed = Event()
+                trace = []
+                executors = []
+                retained_results = []
+
+                class ControlledExecutor:
+                    def __init__(self, max_workers, thread_name_prefix):
+                        del max_workers
+                        self.thread_name_prefix = thread_name_prefix
+                        self.shutdown_called = False
+                        self.futures = []
+                        executors.append(self)
+
+                    def submit(self, function, *future_args, **future_kwargs):
+                        eager = (
+                            self.thread_name_prefix == "kws-feature-cache"
+                            or export_eager
+                        )
+                        future = ControlledFuture(
+                            function,
+                            future_args,
+                            future_kwargs,
+                            eager=eager,
+                        )
+                        self.futures.append(future)
+                        return future
+
+                    def shutdown(self, wait=True, cancel_futures=False):
+                        del wait
+                        self.shutdown_called = True
+                        if cancel_futures:
+                            for future in self.futures:
+                                future.cancel()
+
+                def fake_batched(*, runtime, items, args, batch_size):
+                    del runtime, args
+                    self.assertEqual(batch_size, 2)
+
+                    def generate_results():
+                        item = next(iter(items))
+                        try:
+                            yield item.item_id, {0.5: [detection]}
+                            trace.append("decode-error")
+                            raise DecodeFailure("later decode failed")
+                        finally:
+                            trace.append("results-closed")
+                            results_closed.set()
+
+                    result = generate_results()
+                    # Keep an external reference so CPython refcount cleanup
+                    # cannot make an omitted explicit results.close() pass.
+                    retained_results.append(result)
+                    return result
+
+                def fake_append_manifest_detections(**kwargs):
+                    del kwargs
+                    try:
+                        if export_error:
+                            trace.append("export-error")
+                            raise ExportFailure("earlier export failed")
+                        trace.append("export-success")
+                        return 0
+                    finally:
+                        export_finished.set()
+
+                with mock.patch.object(
+                    MODULE,
+                    "load_manifest",
+                    return_value=([entry], ["audio_path", "keyword"]),
+                ), mock.patch.object(
+                    MODULE,
+                    "build_keywords_graphs",
+                    return_value={0.5: self.Graph()},
+                ), mock.patch.object(
+                    MODULE,
+                    "run_keyword_inference_multi_threshold_batched",
+                    side_effect=fake_batched,
+                ), mock.patch.object(
+                    MODULE, "ThreadPoolExecutor", ControlledExecutor
+                ), mock.patch.object(
+                    MODULE,
+                    "_append_manifest_detections",
+                    side_effect=fake_append_manifest_detections,
+                ):
+                    with self.assertRaises(expected_error) as caught:
+                        MODULE.run_manifest(args, runtime)
+
+                self.assertTrue(export_finished.is_set())
+                self.assertTrue(results_closed.is_set())
+                writer_executors = [
+                    executor
+                    for executor in executors
+                    if executor.thread_name_prefix == "kws-clip-writer"
+                ]
+                self.assertEqual(len(writer_executors), 1)
+                self.assertTrue(writer_executors[0].shutdown_called)
+                if export_eager:
+                    self.assertEqual(trace, ["export-error", "results-closed"])
+                else:
+                    self.assertEqual(
+                        trace[:2], ["decode-error", "results-closed"]
+                    )
+                    self.assertEqual(
+                        trace[2],
+                        "export-error" if export_error else "export-success",
+                    )
+                if name == "late-export-error":
+                    self.assertIsInstance(caught.exception.__context__, DecodeFailure)
 
     def test_offline_multi_threshold_inference_runs_encoder_once(self):
         model = self.Model()

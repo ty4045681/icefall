@@ -25,6 +25,73 @@ from __future__ import annotations
 from typing import Any, List
 
 
+def state_batch_dim(state_index: int, state_count: int) -> int:
+    """Return the batch dimension for one streaming Zipformer state tensor."""
+    if state_count < 2 or (state_count - 2) % 6 != 0:
+        raise ValueError("unsupported Zipformer state count: {}".format(state_count))
+    if not 0 <= state_index < state_count:
+        raise IndexError("streaming state index is outside the state list")
+    if state_index >= state_count - 2:
+        return 0
+    return 1 if state_index % 6 < 4 else 0
+
+
+def state_batch_size(states: List[Any]) -> int:
+    if not states:
+        raise ValueError("streaming state list must not be empty")
+    dim = state_batch_dim(len(states) - 1, len(states))
+    return int(states[-1].shape[dim])
+
+
+def slice_states(states: List[Any], start: int, stop: int) -> List[Any]:
+    """Take a contiguous zero-copy view of a batched state list."""
+    batch_size = state_batch_size(states)
+    if not 0 <= start <= stop <= batch_size:
+        raise ValueError("streaming state slice is outside the batch")
+    length = stop - start
+    return [
+        state.narrow(state_batch_dim(index, len(states)), start, length)
+        for index, state in enumerate(states)
+    ]
+
+
+def select_states(states: List[Any], indices: List[int]) -> List[Any]:
+    """Select/reorder stream slots while preserving every state's batch axis."""
+    import torch
+
+    batch_size = state_batch_size(states)
+    if any(index < 0 or index >= batch_size for index in indices):
+        raise ValueError("streaming state selection is outside the batch")
+    selection = torch.tensor(indices, dtype=torch.int64, device=states[0].device)
+    result = []
+    for state_index, state in enumerate(states):
+        dim = state_batch_dim(state_index, len(states))
+        if state.device != selection.device:
+            raise ValueError("all streaming states must be on one device")
+        result.append(state.index_select(dim, selection))
+    return result
+
+
+def concat_states(state_batches: List[List[Any]]) -> List[Any]:
+    """Concatenate already-batched state lists using their schema batch axes."""
+    import torch
+
+    if not state_batches:
+        raise ValueError("cannot concatenate an empty streaming-state list")
+    state_count = len(state_batches[0])
+    if any(len(states) != state_count for states in state_batches):
+        raise ValueError("all streaming-state batches must use the same schema")
+    if len(state_batches) == 1:
+        return state_batches[0]
+    return [
+        torch.cat(
+            [states[index] for states in state_batches],
+            dim=state_batch_dim(index, state_count),
+        )
+        for index in range(state_count)
+    ]
+
+
 def stack_states(state_list: List[List[Any]]) -> List[Any]:
     import torch
 

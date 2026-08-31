@@ -72,6 +72,8 @@ jobs:
               pytest -v -s ./test
               python -c "import onnx, onnxruntime"
               pytest -v -s egs/gigaspeech/KWS/zipformer/test_onnx_quantization.py
+              pytest -v -s egs/gigaspeech/KWS/zipformer/test_streaming_kws.py
+              pytest -v -s egs/gigaspeech/KWS/zipformer/test_kws_feature_cache.py
 
               # runt tests for conformer ctc
               cd egs/librispeech/ASR/conformer_ctc

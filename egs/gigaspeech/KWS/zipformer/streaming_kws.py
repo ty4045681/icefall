@@ -54,8 +54,11 @@ import os
 import re
 import sys
 import tempfile
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event
 from typing import (
     AbstractSet,
     Any,
@@ -96,11 +99,12 @@ from kws_progress import (  # noqa: E402
     progress_events_requested,
 )
 from kws_streaming_batch import (  # noqa: E402
-    stack_states,
-    unstack_states,
+    concat_states,
+    select_states,
 )
 
 LOG_EPS = math.log(1e-10)
+PREDICTOR_CACHE_MAX_ENTRIES = 4096
 FBANK_FRAME_SHIFT_MS = 10.0
 ENCODER_SUBSAMPLING_FACTOR = 4
 ENCODER_FRAME_SHIFT_SEC = (
@@ -369,9 +373,9 @@ def get_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help=(
-            "Number of independent audio streams advanced in one streaming "
-            "encoder batch. Values above one require --feature-cache-dir "
-            "and --fail-fast."
+            "Number of independent audio streams advanced together through "
+            "streaming encoder and keyword-search neural batches. Values above "
+            "one require --feature-cache-dir and --fail-fast."
         ),
     )
     parser.add_argument(
@@ -529,6 +533,10 @@ class _DecoderHypothesis:
     ys: List[int]
     log_prob: Any
     context_state: Any
+    # Keep an exact host-side copy for ranking.  Batched search refreshes this
+    # once per encoder frame, avoiding thousands of implicit CUDA scalar
+    # synchronizations from float(log_prob).
+    log_prob_value: Optional[float] = None
     timestamp: List[int] = field(default_factory=list)
     ac_probs: List[float] = field(default_factory=list)
     num_tailing_blanks: int = 0
@@ -594,6 +602,7 @@ class _HypothesisList:
             self.data[hyp.key] = hyp
         else:
             old.log_prob = torch.logaddexp(old.log_prob, hyp.log_prob)
+            old.log_prob_value = None
 
     def values(self) -> List[_DecoderHypothesis]:
         return list(self.data.values())
@@ -606,7 +615,9 @@ class _HypothesisList:
 
 
 def _hypothesis_rank(hyp: _DecoderHypothesis) -> float:
-    return float(hyp.log_prob) / hyp.effective_score_length
+    if hyp.log_prob_value is None:
+        hyp.log_prob_value = float(hyp.log_prob)
+    return hyp.log_prob_value / hyp.effective_score_length
 
 
 def _single_deployment_value(value: Any, default: int, name: str) -> int:
@@ -1586,6 +1597,7 @@ class StatefulKeywordDecoder:
             max_keyword_duration_sec=max_keyword_duration_sec,
         )
         self.frame_offset = 0
+        self._predictor_projection_cache: Dict[Tuple[int, ...], Any] = {}
         self.hypotheses = _HypothesisList()
         self._reset_hypotheses()
 
@@ -1601,6 +1613,7 @@ class StatefulKeywordDecoder:
                     0.0, dtype=self.torch.float32, device=self.device
                 ),
                 context_state=self.keywords_graph.root,
+                log_prob_value=0.0,
                 use_timing_key=self.timing_policy.enabled,
                 score_length=self.context_size,
             )
@@ -1676,6 +1689,7 @@ class StatefulKeywordDecoder:
             ys=ys,
             log_prob=hyp.log_prob + new_score - old_score,
             context_state=new_state,
+            log_prob_value=None,
             timestamp=timestamps,
             ac_probs=ac_probs,
             num_tailing_blanks=tailing_blanks,
@@ -1766,152 +1780,107 @@ class StatefulKeywordDecoder:
         """Consume a shared joiner encoder projection and preserve state."""
         if projected.ndim != 3 or projected.size(0) != 1:
             raise ValueError("StatefulKeywordDecoder expects projected shape (1, T, C)")
-        torch = self.torch
-        detections: List[Detection] = []
+        return _advance_stateful_keyword_decoders_batched(
+            model=self.model,
+            projected=projected,
+            decoder_streams=[(self, 0)],
+            stream_valid_lens=[int(projected.size(1))],
+            predictor_projection_cache=self._predictor_projection_cache,
+        )[0]
 
-        for local_t in range(projected.size(1)):
-            absolute_t = self.frame_offset + local_t
-            groups: Optional[List[_ExpansionGroup]] = None
+    def _prepare_frame(
+        self, absolute_t: int
+    ) -> Tuple[Optional[List[_ExpansionGroup]], List[_DecoderHypothesis]]:
+        groups: Optional[List[_ExpansionGroup]] = None
+        if self.timing_policy.enabled:
+            groups = self._expansion_groups(absolute_t)
+            active = [group.hypothesis for group in groups]
+        else:
+            active = self.hypotheses.values()
+        if not active:
+            raise RuntimeError("keyword beam unexpectedly became empty")
+        return groups, active
+
+    def _make_candidate(
+        self,
+        *,
+        hyp: _DecoderHypothesis,
+        token: int,
+        acoustic_prob: float,
+        absolute_t: int,
+    ) -> Tuple[_DecoderHypothesis, float]:
+        """Advance Python search state; neural scores are attached in one batch."""
+        new_ys = hyp.ys[:]
+        new_timestamps = hyp.timestamp[:]
+        new_ac_probs = hyp.ac_probs[:]
+        new_context_state = hyp.context_state
+        context_score = 0.0
+        tailing_blanks = hyp.num_tailing_blanks + 1
+        score_length = hyp.effective_score_length
+
+        if token not in (self.blank_id, self.unk_id):
+            new_ys.append(token)
+            score_length += 1
+            new_timestamps.append(absolute_t)
+            new_ac_probs.append(acoustic_prob)
+            (
+                context_score,
+                new_context_state,
+                _,
+            ) = self.keywords_graph.forward_one_step(hyp.context_state, token)
+            tailing_blanks = 0
+            if new_context_state.token == -1:
+                if self.timing_policy.enabled:
+                    new_ys = self._initial_decoder_history()
+                else:
+                    new_ys[-self.context_size :] = [-1] * (
+                        self.context_size - 1
+                    ) + [self.blank_id]
             if self.timing_policy.enabled:
-                groups = self._expansion_groups(absolute_t)
-                active = [group.hypothesis for group in groups]
-            else:
-                active = self.hypotheses.values()
-            if not active:
-                raise RuntimeError("keyword beam unexpectedly became empty")
+                new_level = self._state_level(new_context_state)
+                new_timestamps = new_timestamps[-new_level:] if new_level else []
+                new_ac_probs = new_ac_probs[-new_level:] if new_level else []
 
-            decoder_input = torch.tensor(
-                [hyp.ys[-self.context_size :] for hyp in active],
-                device=self.device,
-                dtype=torch.int64,
-            )
-            decoder_out = self.model.decoder(decoder_input, need_pad=False).unsqueeze(1)
-            decoder_out = self.model.joiner.decoder_proj(decoder_out)
-            current_encoder = projected[:, local_t : local_t + 1, :].unsqueeze(2)
-            current_encoder = current_encoder.expand(len(active), -1, -1, -1)
-            logits = (
-                self.model.joiner(current_encoder, decoder_out, project_input=False)
-                .squeeze(1)
-                .squeeze(1)
-            )
-            if self.blank_penalty:
-                logits[:, self.blank_id] -= self.blank_penalty
+        return (
+            _DecoderHypothesis(
+                ys=new_ys,
+                log_prob=None,
+                context_state=new_context_state,
+                log_prob_value=None,
+                timestamp=new_timestamps,
+                ac_probs=new_ac_probs,
+                num_tailing_blanks=tailing_blanks,
+                use_timing_key=self.timing_policy.enabled,
+                score_length=score_length,
+            ),
+            float(context_score),
+        )
 
-            probs = logits.softmax(dim=-1)
-            log_probs = logits.log_softmax(dim=-1)
-            vocab_size = log_probs.size(1)
-            if groups is None:
-                previous = torch.stack(
-                    [hyp.log_prob for hyp in active]
-                ).reshape(-1, 1)
-                combined = log_probs + previous
-            else:
-                blank_like_ids = sorted(
-                    {
-                        token
-                        for token in (self.blank_id, self.unk_id)
-                        if 0 <= token < vocab_size
-                    }
-                )
-                negative_inf = log_probs.new_full((), -float("inf"))
-                blank_base = torch.stack(
-                    [
-                        negative_inf
-                        if group.blank_log_prob is None
-                        else group.blank_log_prob
-                        for group in groups
-                    ]
-                )
-                nonblank_base = torch.stack(
-                    [
-                        negative_inf
-                        if group.nonblank_log_prob is None
-                        else group.nonblank_log_prob
-                        for group in groups
-                    ]
-                )
-                combined = log_probs + nonblank_base.unsqueeze(1)
-                combined[:, blank_like_ids] = (
-                    log_probs[:, blank_like_ids] + blank_base.unsqueeze(1)
-                )
-            top_values, top_indexes = combined.reshape(-1).topk(
-                min(self.beam, combined.numel())
-            )
+    def _finish_frame(self, hypotheses: _HypothesisList) -> Optional[Detection]:
+        self.hypotheses = hypotheses
+        top = self._most_probable_detection_candidate()
+        if top is None:
+            return None
+        detection = self._matched_detection(top)
+        # Preserve the strict `>` behavior in the existing keywords_search.
+        if detection is None or top.num_tailing_blanks <= self.num_tailing_blanks:
+            return None
+        self._reset_hypotheses()
+        return detection
 
-            next_hypotheses = _HypothesisList()
-            for value, flat_index in zip(top_values, top_indexes):
-                if not bool(torch.isfinite(value)):
-                    continue
-                flat = int(flat_index.item())
-                hyp_index = flat // vocab_size
-                token = flat % vocab_size
-                hyp = active[hyp_index]
-                new_ys = hyp.ys[:]
-                new_timestamps = hyp.timestamp[:]
-                new_ac_probs = hyp.ac_probs[:]
-                new_context_state = hyp.context_state
-                context_score = 0.0
-                tailing_blanks = hyp.num_tailing_blanks + 1
-                score_length = hyp.effective_score_length
-
-                if token not in (self.blank_id, self.unk_id):
-                    new_ys.append(token)
-                    score_length += 1
-                    new_timestamps.append(absolute_t)
-                    new_ac_probs.append(float(probs[hyp_index, token].item()))
-                    (
-                        context_score,
-                        new_context_state,
-                        _,
-                    ) = self.keywords_graph.forward_one_step(hyp.context_state, token)
-                    tailing_blanks = 0
-                    if new_context_state.token == -1:
-                        if self.timing_policy.enabled:
-                            new_ys = self._initial_decoder_history()
-                        else:
-                            new_ys[-self.context_size :] = [-1] * (
-                                self.context_size - 1
-                            ) + [self.blank_id]
-                    if self.timing_policy.enabled:
-                        new_level = self._state_level(new_context_state)
-                        new_timestamps = (
-                            new_timestamps[-new_level:] if new_level else []
-                        )
-                        new_ac_probs = new_ac_probs[-new_level:] if new_level else []
-
-                next_hypotheses.add(
-                    _DecoderHypothesis(
-                        ys=new_ys,
-                        log_prob=value + context_score,
-                        context_state=new_context_state,
-                        timestamp=new_timestamps,
-                        ac_probs=new_ac_probs,
-                        num_tailing_blanks=tailing_blanks,
-                        use_timing_key=self.timing_policy.enabled,
-                        score_length=score_length,
-                    )
-                )
-
-            self.hypotheses = next_hypotheses
-            top = self._most_probable_detection_candidate()
-            if top is None:
-                continue
-            detection = self._matched_detection(top)
-            # Preserve the strict `>` behavior in the existing keywords_search.
-            if (
-                detection is not None
-                and top.num_tailing_blanks > self.num_tailing_blanks
-            ):
-                detections.append(detection)
-                self._reset_hypotheses()
-
-        self.frame_offset += projected.size(1)
-        return detections
+    def _has_ready_detection_candidate(self) -> bool:
+        """Cheaply decide whether ranking can possibly emit on this frame."""
+        return any(
+            hyp.num_tailing_blanks > self.num_tailing_blanks
+            and self._matched_detection(hyp) is not None
+            for hyp in self.hypotheses.values()
+        )
 
     def finalize(self) -> List[Detection]:
         """Match a keyword at EOS even if there are insufficient tail blanks."""
         if not self.hypotheses.data:
             return []
+        _refresh_hypothesis_rank_values([self])
         top = self._most_probable_detection_candidate()
         if top is None:
             return []
@@ -1920,6 +1889,348 @@ class StatefulKeywordDecoder:
             return []
         self._reset_hypotheses()
         return [detection]
+
+
+def _refresh_hypothesis_rank_values(
+    decoders: Sequence[StatefulKeywordDecoder],
+) -> None:
+    """Refresh all missing host ranks with one device-to-host transfer."""
+    import torch
+
+    hypotheses = [
+        hyp
+        for decoder in decoders
+        for hyp in decoder.hypotheses.values()
+        if hyp.log_prob_value is None
+    ]
+    if not hypotheses:
+        return
+    values = (
+        torch.stack([hyp.log_prob for hyp in hypotheses]).detach().cpu().tolist()
+    )
+    for hyp, value in zip(hypotheses, values):
+        hyp.log_prob_value = float(value)
+
+
+@dataclass
+class _PreparedKeywordDecoderFrame:
+    output_index: int
+    stream_index: int
+    absolute_t: int
+    decoder: StatefulKeywordDecoder
+    groups: Optional[List[_ExpansionGroup]]
+    active: List[_DecoderHypothesis]
+
+
+def _advance_stateful_keyword_decoders_batched(
+    *,
+    model: Any,
+    projected: Any,
+    decoder_streams: Sequence[Tuple[StatefulKeywordDecoder, int]],
+    stream_valid_lens: Sequence[int],
+    predictor_projection_cache: Optional[Dict[Tuple[int, ...], Any]] = None,
+) -> List[List[Detection]]:
+    """Advance independent searches with one neural batch per encoder frame.
+
+    ContextGraph state, threshold decisions, beam merging, and hit resets stay
+    independent.  Only the stateless predictor/joiner work and segmented top-k
+    are combined.  This turns ``streams * thresholds * frames`` tiny neural
+    launches into roughly ``frames`` launches.
+    """
+    import torch
+
+    if projected.ndim != 3:
+        raise ValueError("projected encoder output must have shape (B, T, C)")
+    if len(stream_valid_lens) != int(projected.size(0)):
+        raise ValueError("stream_valid_lens must match projected batch size")
+    valid_lens = [int(value) for value in stream_valid_lens]
+    if any(value < 0 or value > int(projected.size(1)) for value in valid_lens):
+        raise ValueError("stream valid lengths are outside projected time dimension")
+
+    results: List[List[Detection]] = [[] for _ in decoder_streams]
+    if not decoder_streams:
+        return results
+    # Persistent cached tensors are inference-only.  Use a call-local cache if
+    # a test or library caller has gradients enabled, so no autograd graph can
+    # leak across chunks.
+    model_is_training = bool(getattr(model, "training", False))
+    if model_is_training and predictor_projection_cache is not None:
+        predictor_projection_cache.clear()
+    allow_cross_frame_predictor_cache = not model_is_training
+    predictor_cache = (
+        predictor_projection_cache
+        if predictor_projection_cache is not None
+        and not torch.is_grad_enabled()
+        and allow_cross_frame_predictor_cache
+        else {}
+    )
+    if len({id(decoder) for decoder, _ in decoder_streams}) != len(decoder_streams):
+        raise ValueError("each stateful decoder may appear only once in a neural batch")
+    for decoder, stream_index in decoder_streams:
+        if decoder.model is not model:
+            raise ValueError("all batched keyword decoders must share one model")
+        if not 0 <= stream_index < int(projected.size(0)):
+            raise ValueError("decoder stream index is outside projected batch")
+
+    max_frames = max(valid_lens, default=0)
+    for local_t in range(max_frames):
+        prepared: List[_PreparedKeywordDecoderFrame] = []
+        histories: List[Tuple[int, ...]] = []
+        neural_keys: List[Tuple[int, Tuple[int, ...], float]] = []
+        decoder_rows: List[int] = []
+        active_slots: List[int] = []
+        blank_bases: List[Optional[Any]] = []
+        nonblank_bases: List[Optional[Any]] = []
+
+        for output_index, (decoder, stream_index) in enumerate(decoder_streams):
+            if local_t >= valid_lens[stream_index]:
+                continue
+            absolute_t = decoder.frame_offset + local_t
+            groups, active = decoder._prepare_frame(absolute_t)
+            prepared_index = len(prepared)
+            prepared.append(
+                _PreparedKeywordDecoderFrame(
+                    output_index=output_index,
+                    stream_index=stream_index,
+                    absolute_t=absolute_t,
+                    decoder=decoder,
+                    groups=groups,
+                    active=active,
+                )
+            )
+            for active_index, hyp in enumerate(active):
+                history = tuple(hyp.ys[-decoder.context_size :])
+                histories.append(history)
+                neural_keys.append(
+                    (stream_index, history, float(decoder.blank_penalty))
+                )
+                decoder_rows.append(prepared_index)
+                active_slots.append(active_index)
+                if groups is None:
+                    blank_bases.append(hyp.log_prob)
+                    nonblank_bases.append(hyp.log_prob)
+                else:
+                    blank_bases.append(groups[active_index].blank_log_prob)
+                    nonblank_bases.append(groups[active_index].nonblank_log_prob)
+
+        if not prepared:
+            continue
+
+        # Predictor output depends only on token history.  Joiner output also
+        # depends on the stream's current encoder frame and blank penalty.
+        # Deduplicating both levels makes identical threshold lanes almost free
+        # until their search states genuinely diverge.
+        unique_histories: List[Tuple[int, ...]] = []
+        history_ids: Dict[Tuple[int, ...], int] = {}
+        for history in histories:
+            if history not in history_ids:
+                history_ids[history] = len(unique_histories)
+                unique_histories.append(history)
+
+        unique_neural_keys: List[Tuple[int, Tuple[int, ...], float]] = []
+        neural_ids: Dict[Tuple[int, Tuple[int, ...], float], int] = {}
+        neural_inverse: List[int] = []
+        for key in neural_keys:
+            value = neural_ids.get(key)
+            if value is None:
+                value = len(unique_neural_keys)
+                neural_ids[key] = value
+                unique_neural_keys.append(key)
+            neural_inverse.append(value)
+
+        if not allow_cross_frame_predictor_cache:
+            predictor_cache.clear()
+        if predictor_cache:
+            cached = next(iter(predictor_cache.values()))
+            if (
+                cached.device != projected.device
+                or cached.dtype != projected.dtype
+            ):
+                predictor_cache.clear()
+        missing_histories = [
+            history for history in unique_histories if history not in predictor_cache
+        ]
+        if (
+            len(predictor_cache) + len(missing_histories)
+            > PREDICTOR_CACHE_MAX_ENTRIES
+        ):
+            predictor_cache.clear()
+            missing_histories = unique_histories
+        cache_current_histories = (
+            len(unique_histories) <= PREDICTOR_CACHE_MAX_ENTRIES
+        )
+        missing_decoder_out = None
+        if missing_histories:
+            decoder_input = torch.tensor(
+                missing_histories,
+                dtype=torch.int64,
+                device=projected.device,
+            )
+            missing_decoder_out = model.decoder(
+                decoder_input, need_pad=False
+            ).unsqueeze(1)
+            missing_decoder_out = model.joiner.decoder_proj(missing_decoder_out)
+            if cache_current_histories:
+                for history_index, history in enumerate(missing_histories):
+                    predictor_cache[history] = missing_decoder_out[
+                        history_index : history_index + 1
+                    ]
+        if len(missing_histories) == len(unique_histories):
+            assert missing_decoder_out is not None
+            decoder_out = missing_decoder_out
+        else:
+            decoder_out = torch.cat(
+                [predictor_cache[history] for history in unique_histories], dim=0
+            )
+        neural_history_ids = torch.tensor(
+            [history_ids[key[1]] for key in unique_neural_keys],
+            dtype=torch.int64,
+            device=projected.device,
+        )
+        neural_stream_ids = torch.tensor(
+            [key[0] for key in unique_neural_keys],
+            dtype=torch.int64,
+            device=projected.device,
+        )
+        current_encoder = (
+            projected[neural_stream_ids, local_t, :].unsqueeze(1).unsqueeze(2)
+        )
+        neural_decoder = decoder_out.index_select(0, neural_history_ids)
+        unique_logits = (
+            model.joiner(current_encoder, neural_decoder, project_input=False)
+            .squeeze(1)
+            .squeeze(1)
+        )
+        penalties = unique_logits.new_tensor([key[2] for key in unique_neural_keys])
+        blank_id = prepared[0].decoder.blank_id
+        if any(decoder.blank_id != blank_id for decoder, _ in decoder_streams):
+            raise ValueError("batched decoders must share one blank ID")
+        if bool(any(key[2] != 0.0 for key in unique_neural_keys)):
+            unique_logits[:, blank_id] -= penalties
+        unique_probs = unique_logits.softmax(dim=-1)
+        unique_log_probs = unique_logits.log_softmax(dim=-1)
+        neural_inverse_tensor = torch.tensor(
+            neural_inverse, dtype=torch.int64, device=projected.device
+        )
+        probs = unique_probs.index_select(0, neural_inverse_tensor)
+        log_probs = unique_log_probs.index_select(0, neural_inverse_tensor)
+        vocab_size = int(log_probs.size(1))
+
+        negative_inf = log_probs.new_full((), -float("inf"))
+        blank_base = torch.stack(
+            [negative_inf if value is None else value for value in blank_bases]
+        )
+        nonblank_base = torch.stack(
+            [negative_inf if value is None else value for value in nonblank_bases]
+        )
+        combined = log_probs + nonblank_base.unsqueeze(1)
+        blank_like_ids = sorted(
+            {
+                token
+                for token in (blank_id, prepared[0].decoder.unk_id)
+                if 0 <= token < vocab_size
+            }
+        )
+        if any(
+            decoder.unk_id != prepared[0].decoder.unk_id
+            for decoder, _ in decoder_streams
+        ):
+            raise ValueError("batched decoders must share one unknown-token ID")
+        combined[:, blank_like_ids] = (
+            log_probs[:, blank_like_ids] + blank_base.unsqueeze(1)
+        )
+
+        max_active = max(len(work.active) for work in prepared)
+        candidate_grid = combined.new_full(
+            (len(prepared), max_active, vocab_size), -float("inf")
+        )
+        decoder_row_tensor = torch.tensor(
+            decoder_rows, dtype=torch.int64, device=projected.device
+        )
+        active_slot_tensor = torch.tensor(
+            active_slots, dtype=torch.int64, device=projected.device
+        )
+        candidate_grid[decoder_row_tensor, active_slot_tensor, :] = combined
+        flattened_candidates = candidate_grid.flatten(1)
+        topk_sizes = [
+            min(work.decoder.beam, len(work.active) * vocab_size)
+            for work in prepared
+        ]
+        max_topk = max(topk_sizes)
+        top_values, top_indexes = flattened_candidates.topk(max_topk, dim=1)
+
+        active_lookup = torch.full(
+            (len(prepared), max_active),
+            -1,
+            dtype=torch.int64,
+            device=projected.device,
+        )
+        active_lookup[decoder_row_tensor, active_slot_tensor] = torch.arange(
+            len(histories), dtype=torch.int64, device=projected.device
+        )
+        top_slots = top_indexes // vocab_size
+        top_tokens = top_indexes % vocab_size
+        selected_active = active_lookup.gather(1, top_slots).clamp_min(0)
+        selected_probs = probs[selected_active, top_tokens]
+
+        # Two bulk device-to-host copies per frame replace .item()/bool() in
+        # every stream, threshold, hypothesis, and frame.
+        top_host = torch.stack((top_values, selected_probs), dim=-1).detach().cpu()
+        top_indexes_host = top_indexes.detach().cpu()
+        top_values_list = top_host[..., 0].tolist()
+        selected_probs_list = top_host[..., 1].tolist()
+        top_indexes_list = top_indexes_host.tolist()
+
+        candidate_descriptors: List[List[Optional[_DecoderHypothesis]]] = [
+            [None] * max_topk for _ in prepared
+        ]
+        context_scores = [[0.0] * max_topk for _ in prepared]
+        for prepared_index, work in enumerate(prepared):
+            for rank in range(topk_sizes[prepared_index]):
+                if not math.isfinite(float(top_values_list[prepared_index][rank])):
+                    continue
+                flat_index = int(top_indexes_list[prepared_index][rank])
+                hyp_index = flat_index // vocab_size
+                token = flat_index % vocab_size
+                candidate, context_score = work.decoder._make_candidate(
+                    hyp=work.active[hyp_index],
+                    token=token,
+                    acoustic_prob=float(selected_probs_list[prepared_index][rank]),
+                    absolute_t=work.absolute_t,
+                )
+                candidate_descriptors[prepared_index][rank] = candidate
+                context_scores[prepared_index][rank] = context_score
+
+        candidate_log_probs = top_values + top_values.new_tensor(context_scores)
+        for prepared_index, work in enumerate(prepared):
+            next_hypotheses = _HypothesisList()
+            for rank in range(topk_sizes[prepared_index]):
+                candidate = candidate_descriptors[prepared_index][rank]
+                if candidate is None:
+                    continue
+                candidate.log_prob = candidate_log_probs[prepared_index, rank]
+                next_hypotheses.add(candidate)
+            work.decoder.hypotheses = next_hypotheses
+
+        # Context-score addition and any logaddexp merges stay on the model
+        # device.  Refresh exact float32 host ranks once before hit selection.
+        ready_works = [
+            work
+            for work in prepared
+            if work.decoder._has_ready_detection_candidate()
+        ]
+        _refresh_hypothesis_rank_values(
+            [work.decoder for work in ready_works]
+        )
+
+        for work in ready_works:
+            detection = work.decoder._finish_frame(work.decoder.hypotheses)
+            if detection is not None:
+                results[work.output_index].append(detection)
+
+    for decoder, stream_index in decoder_streams:
+        decoder.frame_offset += valid_lens[stream_index]
+    return results
 
 
 class MultiThresholdKeywordDecoder:
@@ -1939,6 +2250,7 @@ class MultiThresholdKeywordDecoder:
         if not keywords_graphs:
             raise ValueError("at least one keyword threshold is required")
         self.model = model
+        self._predictor_projection_cache: Dict[Tuple[int, ...], Any] = {}
         self.decoders = {
             float(threshold): StatefulKeywordDecoder(
                 model=model,
@@ -1965,12 +2277,19 @@ class MultiThresholdKeywordDecoder:
             raise ValueError(
                 "MultiThresholdKeywordDecoder expects projected shape (1, T, C)"
             )
-        return {
-            threshold: decoder.advance_projected(projected)
-            for threshold, decoder in self.decoders.items()
-        }
+        thresholds = list(self.decoders)
+        decoders = [self.decoders[threshold] for threshold in thresholds]
+        values = _advance_stateful_keyword_decoders_batched(
+            model=self.model,
+            projected=projected,
+            decoder_streams=[(decoder, 0) for decoder in decoders],
+            stream_valid_lens=[int(projected.size(1))],
+            predictor_projection_cache=self._predictor_projection_cache,
+        )
+        return dict(zip(thresholds, values))
 
     def finalize(self) -> Dict[float, List[Detection]]:
+        _refresh_hypothesis_rank_values(list(self.decoders.values()))
         return {
             threshold: decoder.finalize()
             for threshold, decoder in self.decoders.items()
@@ -2006,8 +2325,6 @@ def streaming_forward(
     """Advance encoder-embed and Zipformer caches by one chunk."""
     import torch
 
-    from icefall.utils import make_pad_mask
-
     cached_embed_left_pad = states[-2]
     x, x_lens, new_cached_embed_left_pad = model.encoder_embed.streaming_forward(
         x=features,
@@ -2021,7 +2338,10 @@ def streaming_forward(
             )
         )
 
-    src_key_padding_mask = make_pad_mask(x_lens)
+    # Use the host-known encoder time dimension.  make_pad_mask() derives it
+    # through lengths.max(), which synchronizes CUDA on every streaming step.
+    positions = torch.arange(x.size(1), device=x.device)
+    src_key_padding_mask = positions.unsqueeze(0) >= x_lens.unsqueeze(1)
     processed_mask = torch.arange(left_context_len, device=x.device).expand(
         x.size(0), left_context_len
     )
@@ -2135,10 +2455,81 @@ def run_keyword_inference_multi_threshold(
     return detections
 
 
+class _FeatureBatchStager:
+    """Pack CPU feature slices and issue one H2D copy per encoder step."""
+
+    def __init__(
+        self,
+        *,
+        max_batch_size: int,
+        segment_frames: int,
+        feature_dim: int,
+        dtype: Any,
+        device: Any,
+        pad_value: float,
+    ) -> None:
+        import torch
+
+        self.device = device
+        self.pad_value = pad_value
+        self.use_pinned_memory = device.type == "cuda"
+        self.buffers = [
+            torch.empty(
+                max_batch_size,
+                segment_frames,
+                feature_dim,
+                dtype=dtype,
+                device="cpu",
+                pin_memory=self.use_pinned_memory,
+            )
+            for _ in range(2)
+        ]
+        self.events = [None, None]
+        self.next_buffer = 0
+        self.segment_frames = segment_frames
+        self.feature_dim = feature_dim
+        self.dtype = dtype
+
+    def stage(self, segments: Sequence[Any]) -> Any:
+        import torch
+
+        if not segments:
+            raise ValueError("cannot stage an empty feature batch")
+        index = self.next_buffer
+        self.next_buffer = (self.next_buffer + 1) % len(self.buffers)
+        event = self.events[index]
+        if event is not None:
+            event.synchronize()
+
+        target = self.buffers[index][: len(segments)]
+        target.fill_(self.pad_value)
+        for row, segment in enumerate(segments):
+            if segment.device.type != "cpu":
+                raise ValueError("batched cached features must remain on CPU")
+            if segment.ndim != 2 or int(segment.size(1)) != self.feature_dim:
+                raise ValueError("feature dimensions changed inside a stream batch")
+            if segment.dtype != self.dtype:
+                raise ValueError("feature dtype changed inside a stream batch")
+            frames = min(int(segment.size(0)), self.segment_frames)
+            if frames:
+                target[row, :frames].copy_(segment[:frames])
+
+        if self.device.type == "cpu":
+            return target
+        result = target.to(
+            self.device,
+            non_blocking=self.use_pinned_memory,
+        )
+        if self.use_pinned_memory:
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(self.device))
+            self.events[index] = event
+        return result
+
+
 @dataclass
 class _ActiveKeywordBatchStream:
     item: KeywordBatchItem
-    states: List[Any]
     decoder: MultiThresholdKeywordDecoder
     position: int
     padded_frames: int
@@ -2170,6 +2561,12 @@ def run_keyword_inference_multi_threshold_batched(
     source = iter(items)
     source_exhausted = False
     active: List[_ActiveKeywordBatchStream] = []
+    batch_states: Optional[List[Any]] = None
+    feature_stager: Optional[_FeatureBatchStager] = None
+    predictor_projection_cache: Dict[Tuple[int, ...], Any] = {}
+    feature_lens_template = torch.full(
+        (batch_size,), required_segment, dtype=torch.int64, device=device
+    )
 
     def add_stream(item: KeywordBatchItem) -> None:
         features = item.features
@@ -2194,7 +2591,6 @@ def run_keyword_inference_multi_threshold_batched(
         active.append(
             _ActiveKeywordBatchStream(
                 item=item,
-                states=get_init_states(model, device, batch_size=1),
                 decoder=decoder,
                 position=0,
                 padded_frames=int(features.size(0))
@@ -2205,6 +2601,7 @@ def run_keyword_inference_multi_threshold_batched(
         )
 
     while active or not source_exhausted:
+        active_before_refill = len(active)
         while len(active) < batch_size and not source_exhausted:
             try:
                 add_stream(next(source))
@@ -2212,6 +2609,16 @@ def run_keyword_inference_multi_threshold_batched(
                 source_exhausted = True
         if not active:
             break
+        added = len(active) - active_before_refill
+        if added:
+            fresh_states = get_init_states(model, device, batch_size=added)
+            batch_states = (
+                fresh_states
+                if batch_states is None
+                else concat_states([batch_states, fresh_states])
+            )
+        if batch_states is None:
+            raise RuntimeError("streaming state batch was not initialized")
 
         segments = []
         finishing = []
@@ -2220,24 +2627,21 @@ def run_keyword_inference_multi_threshold_batched(
             segment = features[
                 stream.position : stream.position + required_segment
             ]
-            if segment.size(0) < required_segment:
-                segment = torch.nn.functional.pad(
-                    segment,
-                    (0, 0, 0, required_segment - segment.size(0)),
-                    value=LOG_EPS,
-                )
-            segments.append(segment.to(device))
+            segments.append(segment)
             stream.position += feature_step
             finishing.append(stream.position >= stream.padded_frames)
 
-        feature_batch = torch.stack(segments, dim=0)
-        feature_lens = torch.full(
-            (len(active),),
-            required_segment,
-            dtype=torch.int64,
-            device=device,
-        )
-        batch_states = stack_states([stream.states for stream in active])
+        if feature_stager is None:
+            feature_stager = _FeatureBatchStager(
+                max_batch_size=batch_size,
+                segment_frames=required_segment,
+                feature_dim=int(segments[0].size(1)),
+                dtype=segments[0].dtype,
+                device=device,
+                pad_value=LOG_EPS,
+            )
+        feature_batch = feature_stager.stage(segments)
+        feature_lens = feature_lens_template[: len(active)]
         encoder_out, encoder_out_lens, new_batch_states = streaming_forward(
             features=feature_batch,
             feature_lens=feature_lens,
@@ -2246,18 +2650,36 @@ def run_keyword_inference_multi_threshold_batched(
             chunk_size=chunk_size,
             left_context_len=left_context,
         )
-        stream_states = unstack_states(new_batch_states)
         projected = model.joiner.encoder_proj(encoder_out)
+        valid_lens = [
+            int(value) for value in encoder_out_lens.detach().cpu().tolist()
+        ]
+        decoder_streams: List[Tuple[StatefulKeywordDecoder, int]] = []
+        decoder_targets: List[Tuple[_ActiveKeywordBatchStream, float]] = []
+        for stream_index, stream in enumerate(active):
+            for threshold, decoder in stream.decoder.decoders.items():
+                decoder_streams.append((decoder, stream_index))
+                decoder_targets.append((stream, threshold))
+        decoded = _advance_stateful_keyword_decoders_batched(
+            model=model,
+            projected=projected,
+            decoder_streams=decoder_streams,
+            stream_valid_lens=valid_lens,
+            predictor_projection_cache=predictor_projection_cache,
+        )
+        for (stream, threshold), detections in zip(decoder_targets, decoded):
+            stream.detections[threshold].extend(detections)
+
+        _refresh_hypothesis_rank_values(
+            [
+                decoder
+                for stream, is_finishing in zip(active, finishing)
+                if is_finishing
+                for decoder in stream.decoder.decoders.values()
+            ]
+        )
         completed = []
         for index, stream in enumerate(active):
-            stream.states = stream_states[index]
-            valid = int(encoder_out_lens[index].item())
-            if valid:
-                values = stream.decoder.advance_projected(
-                    projected[index : index + 1, :valid, :]
-                )
-                for threshold, detections in values.items():
-                    stream.detections[threshold].extend(detections)
             if finishing[index]:
                 for threshold, detections in stream.decoder.finalize().items():
                     stream.detections[threshold].extend(detections)
@@ -2267,8 +2689,19 @@ def run_keyword_inference_multi_threshold_batched(
             (active[index].item.item_id, active[index].detections)
             for index in completed
         ]
-        for index in reversed(completed):
-            del active[index]
+        if completed:
+            completed_set = set(completed)
+            survivor_indices = [
+                index for index in range(len(active)) if index not in completed_set
+            ]
+            active = [active[index] for index in survivor_indices]
+            batch_states = (
+                select_states(new_batch_states, survivor_indices)
+                if survivor_indices
+                else None
+            )
+        else:
+            batch_states = new_batch_states
         for result in results:
             yield result
 
@@ -3048,78 +3481,193 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
         contexts: Dict[int, Tuple[ManifestEntry, int]] = {}
 
         def batch_items() -> Iterator[KeywordBatchItem]:
-            for item_id, entry in enumerate(entries):
-                cached = feature_cache.load(entry.audio_path)
-                if cached is None:
-                    raise RuntimeError(
-                        "feature cache became unavailable for {}".format(
-                            entry.audio_path
-                        )
-                    )
-                contexts[item_id] = (entry, cached.num_samples)
-                yield KeywordBatchItem(
-                    item_id=item_id,
-                    features=cached.features,
-                    keywords_graphs=graphs_for(entry),
-                )
+            workers = max(1, min(4, stream_batch_size))
+            prefetch_depth = max(workers, min(stream_batch_size, 8))
+            indexed_entries = iter(enumerate(entries))
+            pending: Any = deque()
+            executor = ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="kws-feature-cache",
+            )
 
+            def submit_one() -> bool:
+                try:
+                    item_id, entry = next(indexed_entries)
+                except StopIteration:
+                    return False
+                future = executor.submit(
+                    feature_cache.load, entry.audio_path
+                )
+                pending.append((item_id, entry, future))
+                return True
+
+            try:
+                while len(pending) < prefetch_depth and submit_one():
+                    pass
+                while pending:
+                    item_id, entry, future = pending.popleft()
+                    # Results are intentionally consumed in manifest order even
+                    # if later reads finish first, preserving fail-fast behavior.
+                    cached = future.result()
+                    submit_one()
+                    if cached is None:
+                        raise RuntimeError(
+                            "feature cache became unavailable for {}".format(
+                                entry.audio_path
+                            )
+                        )
+                    contexts[item_id] = (entry, cached.num_samples)
+                    yield KeywordBatchItem(
+                        item_id=item_id,
+                        features=cached.features,
+                        keywords_graphs=graphs_for(entry),
+                    )
+            finally:
+                while pending:
+                    _, _, future = pending.popleft()
+                    future.cancel()
+                executor.shutdown(wait=True)
+
+        batch_item_iterator = batch_items()
         results = run_keyword_inference_multi_threshold_batched(
             runtime=runtime,
-            items=batch_items(),
+            items=batch_item_iterator,
             args=args,
             batch_size=stream_batch_size,
         )
         completed = 0
-        with torch.inference_mode():
-            for item_id, detections_by_threshold in display.track(results):
-                entry, num_samples = contexts.pop(int(item_id))
-                trial_output_start = len(output_rows)
-                try:
-                    miss_trial_count += _append_manifest_detections(
-                        entry=entry,
-                        detections_by_threshold=detections_by_threshold,
-                        thresholds=thresholds,
-                        num_samples=num_samples,
-                        waveform=None,
-                        wav_root=wav_root,
-                        output_manifest=output_manifest,
-                        output_rows=output_rows,
-                        protected_clip_paths=protected_clip_paths,
-                        runtime=runtime,
-                        args=args,
-                        multi_threshold_mode=multi_threshold_mode,
-                    )
-                    _append_evaluation_trial_results(
-                        records=evaluation_records,
-                        entry=entry,
-                        thresholds=thresholds,
-                        output_rows=output_rows[trial_output_start:],
-                        output_manifest=output_manifest,
-                        artifact_output_dir=output_dir,
-                        detections_by_threshold=detections_by_threshold,
-                        num_samples=num_samples,
-                    )
-                except Exception as error:
-                    errors.append((entry.row_number, str(entry.audio_path), str(error)))
-                    _append_evaluation_trial_results(
-                        records=evaluation_records,
-                        entry=entry,
-                        thresholds=thresholds,
-                        output_rows=output_rows[trial_output_start:],
-                        output_manifest=output_manifest,
-                        artifact_output_dir=output_dir,
-                        detections_by_threshold=detections_by_threshold,
-                        num_samples=num_samples,
-                        error=error,
-                    )
-                    completed += 1
-                    publish_progress(completed)
-                    if args.fail_fast:
+        export_abort = Event()
+        export_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="kws-clip-writer",
+        )
+        pending_exports: Any = deque()
+        max_pending_exports = max(2, 2 * stream_batch_size)
+
+        def export_trial(
+            entry: ManifestEntry,
+            num_samples: int,
+            detections_by_threshold: Mapping[float, List[Detection]],
+        ) -> Tuple[int, List[Dict[str, Any]], Optional[Exception]]:
+            local_rows: List[Dict[str, Any]] = []
+            if export_abort.is_set():
+                return 0, local_rows, RuntimeError("clip export was cancelled")
+            try:
+                missed = _append_manifest_detections(
+                    entry=entry,
+                    detections_by_threshold=detections_by_threshold,
+                    thresholds=thresholds,
+                    num_samples=num_samples,
+                    waveform=None,
+                    wav_root=wav_root,
+                    output_manifest=output_manifest,
+                    output_rows=local_rows,
+                    protected_clip_paths=protected_clip_paths,
+                    runtime=runtime,
+                    args=args,
+                    multi_threshold_mode=multi_threshold_mode,
+                )
+                return missed, local_rows, None
+            except Exception as error:
+                export_abort.set()
+                return 0, local_rows, error
+
+        def consume_export() -> None:
+            nonlocal completed, miss_trial_count
+            entry, num_samples, detections_by_threshold, future = (
+                pending_exports.popleft()
+            )
+            missed, trial_rows, error = future.result()
+            output_rows.extend(trial_rows)
+            if error is None:
+                miss_trial_count += missed
+                _append_evaluation_trial_results(
+                    records=evaluation_records,
+                    entry=entry,
+                    thresholds=thresholds,
+                    output_rows=trial_rows,
+                    output_manifest=output_manifest,
+                    artifact_output_dir=output_dir,
+                    detections_by_threshold=detections_by_threshold,
+                    num_samples=num_samples,
+                )
+            else:
+                errors.append((entry.row_number, str(entry.audio_path), str(error)))
+                _append_evaluation_trial_results(
+                    records=evaluation_records,
+                    entry=entry,
+                    thresholds=thresholds,
+                    output_rows=trial_rows,
+                    output_manifest=output_manifest,
+                    artifact_output_dir=output_dir,
+                    detections_by_threshold=detections_by_threshold,
+                    num_samples=num_samples,
+                    error=error,
+                )
+            completed += 1
+            publish_progress(completed)
+            if error is not None:
+                if args.fail_fast:
+                    raise error
+                logging.error(
+                    "Failed manifest row %s: %s", entry.row_number, error
+                )
+
+        display.start()
+        try:
+            result_iterator = iter(results)
+            with torch.inference_mode():
+                while True:
+                    try:
+                        item_id, detections_by_threshold = next(result_iterator)
+                    except StopIteration:
+                        break
+                    except Exception:
+                        # Results yielded before a later cache/decode failure
+                        # precede that failure in manifest order.  Finish them
+                        # before propagating it, matching the former synchronous
+                        # export semantics.
+                        while pending_exports:
+                            consume_export()
                         raise
-                    logging.exception("Failed manifest row %s", entry.row_number)
-                    continue
-                completed += 1
-                publish_progress(completed)
+                    try:
+                        entry, num_samples = contexts.pop(int(item_id))
+                        future = export_executor.submit(
+                            export_trial,
+                            entry,
+                            num_samples,
+                            detections_by_threshold,
+                        )
+                    except Exception:
+                        while pending_exports:
+                            consume_export()
+                        raise
+                    pending_exports.append(
+                        (entry, num_samples, detections_by_threshold, future)
+                    )
+                    while pending_exports and pending_exports[0][3].done():
+                        consume_export()
+                    if len(pending_exports) >= max_pending_exports:
+                        consume_export()
+            while pending_exports:
+                consume_export()
+        finally:
+            export_abort.set()
+            while pending_exports:
+                _, _, _, future = pending_exports.popleft()
+                future.cancel()
+            try:
+                close_results = getattr(results, "close", None)
+                if close_results is not None:
+                    close_results()
+            finally:
+                try:
+                    close_items = getattr(batch_item_iterator, "close", None)
+                    if close_items is not None:
+                        close_items()
+                finally:
+                    export_executor.shutdown(wait=True)
+                    display.stop()
 
         threshold_order = {
             _format_threshold(value): index for index, value in enumerate(thresholds)

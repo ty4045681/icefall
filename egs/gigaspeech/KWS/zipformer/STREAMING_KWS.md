@@ -23,9 +23,10 @@ audio/json_ids.wav,"[123,456]",1
 ```
 
 Negative-set evaluation writes one row per audio clip. Repeat `--keyword`
-to fill a `keywords` JSON column and a shared ContextGraph; the `keyword`
-cell is then `DEVICE`. Passing `--keywords` in manifest mode does the same
-thing: every row uses that list, and duplicate audio paths are rejected.
+or pass `--keyword-list` (one keyword per line) to fill a `keywords` JSON
+column and a shared ContextGraph; the `keyword` cell is then `DEVICE`.
+Passing `--keywords` in manifest mode does the same thing: every row uses
+that list, and duplicate audio paths are rejected.
 Without `--keywords` and without a `keywords` column, each row still builds
 its own single-keyword graph so cartesian dma-kws manifests keep working.
 

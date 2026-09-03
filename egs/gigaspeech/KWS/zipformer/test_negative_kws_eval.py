@@ -482,6 +482,112 @@ class TestPrepare(unittest.TestCase):
             self.assertEqual(return_code, 2)
             self.assertIn("reserved", stderr)
 
+    def test_prepare_reads_keyword_list_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_dir = root / "wavs"
+            write_wav(input_dir / "a.wav", 0.2)
+            keyword_list = root / "keywords.txt"
+            keyword_list.write_text(
+                "\n".join(["HEY EVA", "", "  OK GOOGLE  ", "HEY EVA", ""]),
+                encoding="utf-8",
+            )
+            output = root / "manifest.csv"
+
+            return_code, _, stderr = quiet_main(
+                [
+                    "prepare",
+                    "--input-dir",
+                    str(input_dir),
+                    "--output-manifest",
+                    str(output),
+                    "--keyword-list",
+                    str(keyword_list),
+                ]
+            )
+
+            self.assertEqual(return_code, 0, stderr)
+            rows = read_csv(output)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["keyword"], MODULE.DEVICE_KEYWORD)
+            self.assertEqual(
+                json.loads(rows[0]["keywords"]),
+                ["HEY EVA", "OK GOOGLE"],
+            )
+
+    def test_prepare_merges_keyword_flags_before_keyword_list(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_dir = root / "wavs"
+            write_wav(input_dir / "a.wav", 0.2)
+            keyword_list = root / "keywords.txt"
+            keyword_list.write_text("OK GOOGLE\nHEY EVA\n", encoding="utf-8")
+            output = root / "manifest.csv"
+
+            return_code, _, stderr = quiet_main(
+                [
+                    "prepare",
+                    "--input-dir",
+                    str(input_dir),
+                    "--output-manifest",
+                    str(output),
+                    "--keyword",
+                    "ALEXA",
+                    "--keyword-list",
+                    str(keyword_list),
+                ]
+            )
+
+            self.assertEqual(return_code, 0, stderr)
+            rows = read_csv(output)
+            self.assertEqual(
+                json.loads(rows[0]["keywords"]),
+                ["ALEXA", "OK GOOGLE", "HEY EVA"],
+            )
+
+    def test_prepare_requires_keyword_or_keyword_list(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_dir = root / "wavs"
+            write_wav(input_dir / "a.wav", 0.2)
+            output = root / "manifest.csv"
+
+            return_code, _, stderr = quiet_main(
+                [
+                    "prepare",
+                    "--input-dir",
+                    str(input_dir),
+                    "--output-manifest",
+                    str(output),
+                ]
+            )
+
+            self.assertEqual(return_code, 2)
+            self.assertIn("--keyword", stderr)
+            self.assertIn("--keyword-list", stderr)
+
+    def test_prepare_rejects_missing_keyword_list(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_dir = root / "wavs"
+            write_wav(input_dir / "a.wav", 0.2)
+            output = root / "manifest.csv"
+
+            return_code, _, stderr = quiet_main(
+                [
+                    "prepare",
+                    "--input-dir",
+                    str(input_dir),
+                    "--output-manifest",
+                    str(output),
+                    "--keyword-list",
+                    str(root / "missing.txt"),
+                ]
+            )
+
+            self.assertEqual(return_code, 2)
+            self.assertIn("keyword list not found", stderr)
+
     def test_build_exposure_rejects_duplicate_audio(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

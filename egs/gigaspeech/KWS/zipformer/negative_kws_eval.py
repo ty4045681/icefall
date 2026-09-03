@@ -153,6 +153,36 @@ def _is_reserved_keyword(keyword: str) -> bool:
     return keyword == DEVICE_KEYWORD or keyword.upper() == DEVICE_KEYWORD
 
 
+def _read_keyword_list(path: Path) -> List[str]:
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError("keyword list not found: {}".format(path))
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except UnicodeDecodeError as error:
+        raise EvaluationError(
+            "keyword list is not valid UTF-8: {}".format(path)
+        ) from error
+    keywords = []
+    for line in lines:
+        keyword = line.strip()
+        if keyword:
+            keywords.append(keyword)
+    if not keywords:
+        raise EvaluationError("keyword list is empty: {}".format(path))
+    return keywords
+
+
+def _prepare_keywords(args: argparse.Namespace) -> List[str]:
+    keywords = list(args.keyword or [])
+    keyword_list = getattr(args, "keyword_list", None)
+    if keyword_list is not None:
+        keywords.extend(_read_keyword_list(Path(keyword_list)))
+    if not keywords:
+        raise EvaluationError("provide --keyword or --keyword-list")
+    return _canonicalize_keywords(keywords)
+
+
 def _canonicalize_keywords(values: Iterable[str]) -> List[str]:
     keywords = []
     seen = set()
@@ -588,7 +618,7 @@ def prepare_manifest(args: argparse.Namespace) -> int:
             )
         )
 
-    keywords = _canonicalize_keywords(args.keyword)
+    keywords = _prepare_keywords(args)
     trial_keyword = _trial_keyword(keywords)
     keywords_cell = _format_keywords_json(keywords)
 
@@ -2830,8 +2860,12 @@ def get_parser() -> argparse.ArgumentParser:
     prepare.add_argument(
         "--keyword",
         action="append",
-        required=True,
         help="Device keyword text or direct BPE form; repeat to fill one shared ContextGraph.",
+    )
+    prepare.add_argument(
+        "--keyword-list",
+        type=Path,
+        help="Text file with one keyword per line; blank lines are ignored.",
     )
     prepare.add_argument(
         "--extensions",

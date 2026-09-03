@@ -883,6 +883,20 @@ class TestManifestAndTimestamps(unittest.TestCase):
         self.assertEqual(token_ids, [[5]])
         self.assertEqual(sp.encode_calls, ["[ALARM]"])
 
+    def test_keyword_spec_phrases_map_text_and_bpe_to_decoder_phrase(self):
+        sp = FakeSentencePiece()
+        mapping = MODULE.keyword_spec_phrases(
+            sp, ["hey eva", "bpe_ids:3 4", "text:[alarm]"]
+        )
+        self.assertEqual(
+            mapping,
+            {
+                "hey eva": "HEY EVA",
+                "bpe_ids:3 4": "HEY EVA",
+                "text:[alarm]": "[ALARM]",
+            },
+        )
+
     def test_malformed_bare_json_is_not_silently_encoded_as_text(self):
         sp = FakeSentencePiece()
         with self.assertRaisesRegex(ValueError, "invalid JSON BPE keyword"):
@@ -2524,6 +2538,218 @@ class TestStatefulKeywordDecoder(unittest.TestCase):
         self.assertEqual(model.joiner.encoder_proj_calls, 1)
         self.assertEqual(len(hits[0.5]), 1)
         self.assertEqual(hits[1.0], [])
+
+
+class TestSharedKeywordGraph(unittest.TestCase):
+    def test_keywords_json_column_selects_one_shared_list(self):
+        entries = [
+            MODULE.ManifestEntry(
+                row_number=2,
+                row={
+                    "audio_path": "a.wav",
+                    "keyword": MODULE.DEVICE_KEYWORD,
+                    "keywords": '["HEY EVA","OK GOOGLE"]',
+                },
+                audio_path=Path("/data/a.wav"),
+                keyword=MODULE.DEVICE_KEYWORD,
+                label=0,
+            ),
+            MODULE.ManifestEntry(
+                row_number=3,
+                row={
+                    "audio_path": "b.wav",
+                    "keyword": MODULE.DEVICE_KEYWORD,
+                    "keywords": '["HEY EVA","OK GOOGLE"]',
+                },
+                audio_path=Path("/data/b.wav"),
+                keyword=MODULE.DEVICE_KEYWORD,
+                label=0,
+            ),
+        ]
+        self.assertEqual(
+            MODULE.resolve_shared_keywords(entries, []),
+            ["HEY EVA", "OK GOOGLE"],
+        )
+
+    def test_cli_keywords_must_match_json_column(self):
+        entry = MODULE.ManifestEntry(
+            row_number=2,
+            row={
+                "audio_path": "a.wav",
+                "keyword": MODULE.DEVICE_KEYWORD,
+                "keywords": '["HEY EVA"]',
+            },
+            audio_path=Path("/data/a.wav"),
+            keyword=MODULE.DEVICE_KEYWORD,
+            label=0,
+        )
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            MODULE.resolve_shared_keywords([entry], ["HEY EVA", "OK GOOGLE"])
+
+    def test_legacy_per_row_keywords_remain_unshared(self):
+        entries = [
+            MODULE.ManifestEntry(
+                row_number=2,
+                row={"audio_path": "a.wav", "keyword": "ONE"},
+                audio_path=Path("/data/a.wav"),
+                keyword="ONE",
+                label=0,
+            ),
+            MODULE.ManifestEntry(
+                row_number=3,
+                row={"audio_path": "a.wav", "keyword": "TWO"},
+                audio_path=Path("/data/a.wav"),
+                keyword="TWO",
+                label=0,
+            ),
+        ]
+        self.assertIsNone(MODULE.resolve_shared_keywords(entries, []))
+
+    def test_device_mode_rejects_duplicate_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "input.csv"
+            manifest.touch()
+            audio = root / "audio.wav"
+            audio.touch()
+            entries = [
+                MODULE.ManifestEntry(
+                    row_number=2,
+                    row={
+                        "audio_path": audio.name,
+                        "keyword": MODULE.DEVICE_KEYWORD,
+                        "keywords": '["HEY EVA","OK GOOGLE"]',
+                    },
+                    audio_path=audio,
+                    keyword=MODULE.DEVICE_KEYWORD,
+                    label=0,
+                ),
+                MODULE.ManifestEntry(
+                    row_number=3,
+                    row={
+                        "audio_path": audio.name,
+                        "keyword": MODULE.DEVICE_KEYWORD,
+                        "keywords": '["HEY EVA","OK GOOGLE"]',
+                    },
+                    audio_path=audio,
+                    keyword=MODULE.DEVICE_KEYWORD,
+                    label=0,
+                ),
+            ]
+            args = SimpleNamespace(
+                manifest=manifest,
+                output_dir=root / "output",
+                output_manifest=None,
+                wav_subdir="wavs",
+                pre_roll_sec=0.15,
+                post_roll_sec=0.15,
+                overwrite=True,
+                keywords=[],
+                keywords_thresholds=None,
+                keywords_threshold=None,
+                progress=False,
+                fail_fast=True,
+                feature_cache_dir=None,
+                stream_batch_size=1,
+            )
+            runtime = SimpleNamespace(
+                model=SimpleNamespace(
+                    parameters=lambda: iter([SimpleNamespace(device="cpu")])
+                ),
+                sp=object(),
+                keywords_score=1.5,
+                keywords_threshold=0.5,
+                decode_mode="streaming",
+                params=SimpleNamespace(chunk_size=16, left_context_frames=64),
+            )
+            with mock.patch.dict(
+                sys.modules, {"torch": SimpleNamespace()}
+            ), mock.patch.object(
+                MODULE,
+                "load_manifest",
+                return_value=(entries, ["audio_path", "keyword", "keywords"]),
+            ):
+                with self.assertRaisesRegex(ValueError, "unique audio"):
+                    MODULE.run_manifest(args, runtime)
+
+    def test_shared_keywords_build_one_graph_for_all_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "input.csv"
+            manifest.touch()
+            audio_paths = [root / "one.wav", root / "two.wav"]
+            for path in audio_paths:
+                path.touch()
+            entries = [
+                MODULE.ManifestEntry(
+                    row_number=index + 2,
+                    row={
+                        "audio_path": path.name,
+                        "keyword": MODULE.DEVICE_KEYWORD,
+                        "keywords": '["HEY EVA","OK GOOGLE"]',
+                    },
+                    audio_path=path,
+                    keyword=MODULE.DEVICE_KEYWORD,
+                    label=0,
+                )
+                for index, path in enumerate(audio_paths)
+            ]
+            args = SimpleNamespace(
+                manifest=manifest,
+                output_dir=root / "output",
+                output_manifest=None,
+                wav_subdir="wavs",
+                pre_roll_sec=0.15,
+                post_roll_sec=0.15,
+                overwrite=True,
+                keywords=[],
+                keywords_thresholds="0.5",
+                keywords_threshold=None,
+                progress=False,
+                fail_fast=True,
+                feature_cache_dir=None,
+                stream_batch_size=1,
+            )
+            runtime = SimpleNamespace(
+                model=SimpleNamespace(
+                    parameters=lambda: iter([SimpleNamespace(device="cpu")])
+                ),
+                sp=object(),
+                keywords_score=1.5,
+                keywords_threshold=0.5,
+                decode_mode="streaming",
+                params=SimpleNamespace(chunk_size=16, left_context_frames=64),
+            )
+            captured = []
+
+            def capture_graphs(sp, keywords, **kwargs):
+                del sp, kwargs
+                captured.append(list(keywords))
+                return {0.5: object()}
+
+            with mock.patch.dict(
+                sys.modules, {"torch": SimpleNamespace(inference_mode=lambda: contextlib.nullcontext())}
+            ), mock.patch.object(
+                MODULE,
+                "load_manifest",
+                return_value=(entries, ["audio_path", "keyword", "keywords"]),
+            ), mock.patch.object(
+                MODULE, "build_keywords_graphs", side_effect=capture_graphs
+            ), mock.patch.object(
+                MODULE, "load_audio", return_value=SimpleNamespace(numel=lambda: 16000)
+            ), mock.patch.object(
+                MODULE, "compute_fbank", return_value=object()
+            ), mock.patch.object(
+                MODULE,
+                "run_keyword_inference_multi_threshold",
+                return_value={0.5: []},
+            ), mock.patch.object(MODULE, "write_output_manifest"), mock.patch.object(
+                MODULE, "write_evaluation_artifacts", return_value={}
+            ):
+                return_code = MODULE.run_manifest(args, runtime)
+
+            self.assertEqual(return_code, 0)
+            self.assertEqual(captured, [["HEY EVA", "OK GOOGLE"]])
 
 
 if __name__ == "__main__":

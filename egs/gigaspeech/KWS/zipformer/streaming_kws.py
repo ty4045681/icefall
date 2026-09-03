@@ -104,6 +104,7 @@ from kws_streaming_batch import (  # noqa: E402
 )
 
 LOG_EPS = math.log(1e-10)
+DEVICE_KEYWORD = "DEVICE"
 PREDICTOR_CACHE_MAX_ENTRIES = 4096
 FBANK_FRAME_SHIFT_MS = 10.0
 ENCODER_SUBSAMPLING_FACTOR = 4
@@ -267,7 +268,9 @@ def get_parser() -> argparse.ArgumentParser:
             "Keyword text or pre-tokenized BPE to spot; repeat for multiple "
             "keywords. BPE forms are bpe_ids:123 456, [123,456], and "
             "bpe_pieces:\u2581HEY \u2581EVA. Required in --wav mode unless supplied "
-            "by --model-config. Manifest rows use their own keyword column."
+            "by --model-config. In --manifest mode this selects one shared "
+            "ContextGraph for every row; omit it to use a keywords JSON column "
+            "or fall back to per-row keyword graphs."
         ),
     )
     parser.add_argument("--device", default="cpu", help="cpu, cuda, or cuda:N")
@@ -733,6 +736,85 @@ def load_manifest(path: Path) -> Tuple[List[ManifestEntry], List[str]]:
     if not entries:
         raise ValueError("manifest contains no trials: {}".format(path))
     return entries, fieldnames
+
+
+def _is_reserved_keyword(keyword: str) -> bool:
+    return keyword == DEVICE_KEYWORD or keyword.upper() == DEVICE_KEYWORD
+
+
+def canonicalize_keywords(values: Sequence[str]) -> List[str]:
+    keywords = []
+    seen = set()
+    for raw_keyword in values:
+        keyword = str(raw_keyword).strip()
+        if not keyword:
+            raise ValueError("keyword must not be empty")
+        if _is_reserved_keyword(keyword):
+            raise ValueError(
+                "keyword {!r} is reserved for device-level aggregates".format(
+                    keyword
+                )
+            )
+        if keyword not in seen:
+            keywords.append(keyword)
+            seen.add(keyword)
+    if not keywords:
+        raise ValueError("at least one keyword is required")
+    return keywords
+
+
+def parse_keywords_json(raw: str) -> List[str]:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError("invalid keywords JSON: {}".format(error)) from error
+    if not isinstance(value, list) or not value:
+        raise ValueError("keywords must be a non-empty JSON array")
+    if any(isinstance(item, bool) or not isinstance(item, str) for item in value):
+        raise ValueError("keywords JSON must be an array of strings")
+    return canonicalize_keywords(value)
+
+
+def resolve_shared_keywords(
+    entries: Sequence[ManifestEntry],
+    cli_keywords: Sequence[str],
+) -> Optional[List[str]]:
+    """Return the shared device keyword list, or None for per-row graphs."""
+    cli = [str(value).strip() for value in cli_keywords if str(value).strip()]
+    json_lists: List[Optional[List[str]]] = []
+    for entry in entries:
+        raw = str(entry.row.get("keywords", "") or "").strip()
+        if raw:
+            json_lists.append(parse_keywords_json(raw))
+        else:
+            json_lists.append(None)
+    has_json = any(item is not None for item in json_lists)
+    if cli:
+        shared = canonicalize_keywords(cli)
+        if has_json:
+            for entry, parsed in zip(entries, json_lists):
+                if parsed is not None and parsed != shared:
+                    raise ValueError(
+                        "CLI --keywords {} does not match manifest row {} "
+                        "keywords {}".format(shared, entry.row_number, parsed)
+                    )
+        return shared
+    if not has_json:
+        return None
+    if any(item is None for item in json_lists):
+        raise ValueError(
+            "keywords JSON column must be present on every manifest row"
+        )
+    shared = json_lists[0]
+    assert shared is not None
+    for entry, parsed in zip(entries, json_lists):
+        if parsed != shared:
+            raise ValueError(
+                "manifest row {} keywords {} differ from {}".format(
+                    entry.row_number, parsed, shared
+                )
+            )
+    return shared
 
 
 def compute_clip_bounds(
@@ -1510,6 +1592,18 @@ def encode_keywords(
     if not phrases:
         raise ValueError("at least one non-empty keyword is required")
     return phrases, token_ids
+
+
+def keyword_spec_phrases(sp: Any, keywords: Sequence[str]) -> Dict[str, str]:
+    """Map each input spec to the phrase `keywords_search` would emit."""
+    mapping: Dict[str, str] = {}
+    for value in keywords:
+        spec = str(value).strip()
+        if not spec or spec in mapping:
+            continue
+        phrases, _token_ids = encode_keywords(sp, [spec])
+        mapping[spec] = phrases[0]
+    return mapping
 
 
 def build_keywords_graph(
@@ -2993,6 +3087,7 @@ def _evaluation_provenance(
     *,
     input_manifest: Path,
     output_manifest: Path,
+    keyword_phrases: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     params = getattr(runtime, "params", None)
     result: Dict[str, Any] = {
@@ -3048,6 +3143,11 @@ def _evaluation_provenance(
         result["feature_cache_dir"] = str(
             Path(feature_cache_dir).expanduser().resolve()
         )
+    if keyword_phrases:
+        result["keyword_phrases"] = [
+            {"spec": spec, "phrase": phrase}
+            for spec, phrase in keyword_phrases.items()
+        ]
     return result
 
 
@@ -3296,6 +3396,21 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
     if output_manifest == input_manifest:
         raise ValueError("output manifest must not overwrite the input manifest")
     entries, input_fields = load_manifest(args.manifest)
+    shared_keywords = resolve_shared_keywords(
+        entries, getattr(args, "keywords", None) or []
+    )
+    if shared_keywords is not None:
+        seen_audio: Dict[Path, int] = {}
+        for entry in entries:
+            previous = seen_audio.get(entry.audio_path)
+            if previous is not None:
+                raise ValueError(
+                    "device-level keyword search requires unique audio files; "
+                    "duplicate audio {} (rows {} and {})".format(
+                        entry.audio_path, previous, entry.row_number
+                    )
+                )
+            seen_audio[entry.audio_path] = entry.row_number
     source_audio_paths = {entry.audio_path for entry in entries}
     _ensure_output_is_not_protected(
         output_manifest,
@@ -3344,7 +3459,8 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
                 )
             )
 
-    graph_cache: Dict[str, Dict[float, Any]] = {}
+    graph_cache: Dict[Tuple[str, ...], Dict[float, Any]] = {}
+    recorded_keyword_phrases: Dict[str, str] = {}
     output_rows: List[Dict[str, Any]] = []
     evaluation_records: List[Dict[str, Any]] = []
     errors: List[Tuple[int, str, str]] = []
@@ -3367,15 +3483,25 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
         )
 
     def graphs_for(entry: ManifestEntry) -> Dict[float, Any]:
-        graphs = graph_cache.get(entry.keyword)
+        keywords = (
+            shared_keywords if shared_keywords is not None else [entry.keyword]
+        )
+        cache_key = tuple(keywords)
+        graphs = graph_cache.get(cache_key)
         if graphs is None:
             graphs = build_keywords_graphs(
                 runtime.sp,
-                [entry.keyword],
+                keywords,
                 score=runtime.keywords_score,
                 thresholds=thresholds,
             )
-            graph_cache[entry.keyword] = graphs
+            graph_cache[cache_key] = graphs
+            try:
+                recorded_keyword_phrases.update(
+                    keyword_spec_phrases(runtime.sp, keywords)
+                )
+            except (TypeError, ValueError, AttributeError):
+                pass
         return graphs
 
     def publish_progress(completed: int) -> None:
@@ -3698,6 +3824,7 @@ def run_manifest(args: argparse.Namespace, runtime: LoadedRuntime) -> int:
             runtime,
             input_manifest=input_manifest,
             output_manifest=output_manifest,
+            keyword_phrases=recorded_keyword_phrases,
         ),
     )
     logging.info(

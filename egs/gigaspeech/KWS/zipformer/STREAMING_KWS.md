@@ -22,6 +22,13 @@ audio/piece_tokens.wav,bpe_pieces:▁HEY ▁EVA,1
 audio/json_ids.wav,"[123,456]",1
 ```
 
+Negative-set evaluation writes one row per audio clip. Repeat `--keyword`
+to fill a `keywords` JSON column and a shared ContextGraph; the `keyword`
+cell is then `DEVICE`. Passing `--keywords` in manifest mode does the same
+thing: every row uses that list, and duplicate audio paths are rejected.
+Without `--keywords` and without a `keywords` column, each row still builds
+its own single-keyword graph so cartesian dma-kws manifests keep working.
+
 `label` is optional. Relative audio paths are resolved against the CSV's
 directory. Extra columns such as `text_variant` and `keyword_phonemes` are
 retained in the output.
@@ -108,8 +115,8 @@ always fail before inference so a malformed dataset is not processed partially.
 ## 控制台进度
 
 批量 manifest 推理在交互式终端中会自动显示进度条，进度单位是
-`audio + keyword` trial，而不是 trial 数乘阈值数，因为所有阈值共享同一遍
-encoder。状态栏同时显示已导出的 clips、无命中的 threshold-trials 和错误数。
+manifest 行（一条音频一次）。设备级多词共用一张 ContextGraph 和一遍
+encoder；所有阈值也共享同一遍 encoder。状态栏同时显示已导出的 clips、无命中的 threshold-trials 和错误数。
 `--progress` 可强制显示，`--no-progress` 可关闭；进度写入 stderr，不影响
 单 WAV 模式的 JSON stdout。优先使用可选的 Rich 渲染；环境未安装 Rich 时
 会自动退化为周期性纯文本，可按需运行 `python3 -m pip install rich`。

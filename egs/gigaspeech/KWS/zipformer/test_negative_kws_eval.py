@@ -400,11 +400,12 @@ class TestPrepare(unittest.TestCase):
 
             self.assertEqual(return_code, 0, stderr)
             rows = read_csv(output)
-            self.assertEqual(len(rows), 4)
+            self.assertEqual(len(rows), 2)
             self.assertEqual({row["label"] for row in rows}, {"0"})
+            self.assertEqual({row["keyword"] for row in rows}, {MODULE.DEVICE_KEYWORD})
             self.assertEqual(
-                {row["keyword"] for row in rows},
-                {"HEY EVA", "bpe_ids:3 4"},
+                {tuple(json.loads(row["keywords"])) for row in rows},
+                {("HEY EVA", "bpe_ids:3 4")},
             )
             self.assertEqual({row["category"] for row in rows}, {"music", "noise"})
             duration_by_category = {
@@ -423,15 +424,85 @@ class TestPrepare(unittest.TestCase):
                     duration_field="source_duration_sec",
                     assume_negative=False,
                 )
-            exposure = MODULE._build_exposure(
+            exposure, device_keywords = MODULE._build_exposure(
                 output,
                 category_field="",
                 duration_field="source_duration_sec",
                 assume_negative=False,
             )
+            self.assertEqual(device_keywords, ["HEY EVA", "bpe_ids:3 4"])
             self.assertEqual(
                 {row["category"] for row in exposure}, {MODULE.UNCATEGORIZED}
             )
+
+    def test_prepare_single_keyword_keeps_readable_keyword_column(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_dir = root / "wavs"
+            write_wav(input_dir / "a.wav", 0.2)
+            output = root / "manifest.csv"
+
+            return_code, _, stderr = quiet_main(
+                [
+                    "prepare",
+                    "--input-dir",
+                    str(input_dir),
+                    "--output-manifest",
+                    str(output),
+                    "--keyword",
+                    "HEY EVA",
+                ]
+            )
+
+            self.assertEqual(return_code, 0, stderr)
+            rows = read_csv(output)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["keyword"], "HEY EVA")
+            self.assertEqual(json.loads(rows[0]["keywords"]), ["HEY EVA"])
+
+    def test_prepare_rejects_reserved_device_keyword(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_dir = root / "wavs"
+            write_wav(input_dir / "a.wav", 0.2)
+            output = root / "manifest.csv"
+
+            return_code, _, stderr = quiet_main(
+                [
+                    "prepare",
+                    "--input-dir",
+                    str(input_dir),
+                    "--output-manifest",
+                    str(output),
+                    "--keyword",
+                    "DEVICE",
+                ]
+            )
+
+            self.assertEqual(return_code, 2)
+            self.assertIn("reserved", stderr)
+
+    def test_build_exposure_rejects_duplicate_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = root / "a.wav"
+            write_wav(audio, 0.2)
+            manifest = root / "manifest.csv"
+            write_csv(
+                manifest,
+                ("audio_path", "keyword", "label"),
+                [
+                    {"audio_path": audio.name, "keyword": "ONE", "label": 0},
+                    {"audio_path": audio.name, "keyword": "TWO", "label": 0},
+                ],
+            )
+            with self.assertRaisesRegex(MODULE.EvaluationError, "duplicate audio"):
+                MODULE._build_exposure(
+                    manifest,
+                    category_field="",
+                    duration_field="source_duration_sec",
+                    assume_negative=False,
+                )
 
     def test_prepare_features_deduplicates_resolved_audio(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -558,7 +629,10 @@ class TestReport(unittest.TestCase):
             self.assertEqual(records[0]["false_alarm_events"], 1)
             self.assertNotIn("qbyt_score", records[0])
             self.assertNotIn("score_semantics", records[0])
-            self.assertEqual(hits[("0.5", 2)], [0.8])
+            self.assertEqual(
+                hits[("0.5", 2)],
+                [MODULE.Hit(score=0.8, detected_keyword="WAKE")],
+            )
             self.assertEqual(semantics, "exact_results_jsonl_v1")
 
     def test_exact_results_reject_mixed_v1_and_v2_rows(self):
@@ -906,6 +980,152 @@ class TestReport(unittest.TestCase):
             self.assertIn("exposure CSV content differs", stderr)
 
 
+class TestDeviceKeywordMetrics(unittest.TestCase):
+    def test_threshold_metrics_split_detected_keyword_with_shared_exposure(self):
+        source_rows = [
+            {
+                "threshold": "0.2",
+                "source_manifest_row": 2,
+                "audio_path": "a.wav",
+                "audio_path_resolved": "/data/a.wav",
+                "keyword": MODULE.DEVICE_KEYWORD,
+                "category": "noise",
+                "duration_sec": "3600",
+                "false_alarm_events": 2,
+                "triggered": 1,
+                "max_score": "0.9",
+            },
+            {
+                "threshold": "0.2",
+                "source_manifest_row": 3,
+                "audio_path": "b.wav",
+                "audio_path_resolved": "/data/b.wav",
+                "keyword": MODULE.DEVICE_KEYWORD,
+                "category": "noise",
+                "duration_sec": "3600",
+                "false_alarm_events": 1,
+                "triggered": 1,
+                "max_score": "0.8",
+            },
+        ]
+        hits = {
+            ("0.2", 2): [
+                MODULE.Hit(score=0.9, detected_keyword="HEY EVA"),
+                MODULE.Hit(score=0.7, detected_keyword="OK GOOGLE"),
+            ],
+            ("0.2", 3): [MODULE.Hit(score=0.8, detected_keyword="HEY EVA")],
+        }
+        rows = MODULE._threshold_metrics(
+            ["0.2"],
+            source_rows,
+            hits=hits,
+            device_keywords=["HEY EVA", "OK GOOGLE"],
+        )
+        indexed = {
+            (row["keyword"], row["category"]): row for row in rows
+        }
+        device_all = indexed[(MODULE.DEVICE_KEYWORD, MODULE.ALL_CATEGORY)]
+        self.assertEqual(int(device_all["false_alarm_events"]), 3)
+        self.assertEqual(int(device_all["triggered_source_trials"]), 2)
+        self.assertAlmostEqual(float(device_all["exposure_hours"]), 2.0)
+        self.assertAlmostEqual(float(device_all["fa_per_hour"]), 1.5)
+
+        hey = indexed[("HEY EVA", MODULE.ALL_CATEGORY)]
+        ok = indexed[("OK GOOGLE", MODULE.ALL_CATEGORY)]
+        self.assertEqual(int(hey["false_alarm_events"]), 2)
+        self.assertEqual(int(ok["false_alarm_events"]), 1)
+        self.assertAlmostEqual(float(hey["exposure_hours"]), 2.0)
+        self.assertAlmostEqual(float(ok["exposure_hours"]), 2.0)
+        self.assertAlmostEqual(
+            float(hey["fa_per_hour"]) + float(ok["fa_per_hour"]),
+            float(device_all["fa_per_hour"]),
+        )
+        self.assertEqual(int(hey["triggered_source_trials"]), 2)
+        self.assertEqual(int(ok["triggered_source_trials"]), 1)
+
+    def test_threshold_metrics_map_text_and_bpe_specs_to_detected_phrases(self):
+        source_rows = [
+            {
+                "threshold": "0.2",
+                "source_manifest_row": 2,
+                "audio_path": "a.wav",
+                "audio_path_resolved": "/data/a.wav",
+                "keyword": MODULE.DEVICE_KEYWORD,
+                "category": "noise",
+                "duration_sec": "3600",
+                "false_alarm_events": 2,
+                "triggered": 1,
+                "max_score": "0.9",
+            }
+        ]
+        hits = {
+            ("0.2", 2): [
+                MODULE.Hit(score=0.9, detected_keyword="HEY EVA"),
+                MODULE.Hit(score=0.7, detected_keyword="[ALARM]"),
+            ]
+        }
+        rows = MODULE._threshold_metrics(
+            ["0.2"],
+            source_rows,
+            hits=hits,
+            device_keywords=["hey eva", "bpe_ids:3 4"],
+            keyword_phrases={"hey eva": "HEY EVA", "bpe_ids:3 4": "[ALARM]"},
+        )
+        indexed = {
+            (row["keyword"], row["category"]): row
+            for row in rows
+            if row["category"] == MODULE.ALL_CATEGORY
+        }
+        self.assertEqual(int(indexed[("HEY EVA", MODULE.ALL_CATEGORY)]["false_alarm_events"]), 1)
+        self.assertEqual(
+            int(indexed[("[ALARM]", MODULE.ALL_CATEGORY)]["false_alarm_events"]), 1
+        )
+        self.assertNotIn(("hey eva", MODULE.ALL_CATEGORY), indexed)
+        self.assertNotIn(("bpe_ids:3 4", MODULE.ALL_CATEGORY), indexed)
+
+    def test_threshold_metrics_uppercase_text_specs_without_phrase_map(self):
+        source_rows = [
+            {
+                "threshold": "0.2",
+                "source_manifest_row": 2,
+                "audio_path": "a.wav",
+                "audio_path_resolved": "/data/a.wav",
+                "keyword": MODULE.DEVICE_KEYWORD,
+                "category": "noise",
+                "duration_sec": "3600",
+                "false_alarm_events": 1,
+                "triggered": 1,
+                "max_score": "0.9",
+            }
+        ]
+        hits = {
+            ("0.2", 2): [MODULE.Hit(score=0.9, detected_keyword="HEY EVA")],
+        }
+        rows = MODULE._threshold_metrics(
+            ["0.2"],
+            source_rows,
+            hits=hits,
+            device_keywords=["hey eva", "OK GOOGLE"],
+        )
+        indexed = {
+            (row["keyword"], row["category"]): row
+            for row in rows
+            if row["category"] == MODULE.ALL_CATEGORY
+        }
+        self.assertEqual(int(indexed[("HEY EVA", MODULE.ALL_CATEGORY)]["false_alarm_events"]), 1)
+        self.assertEqual(
+            int(indexed[("OK GOOGLE", MODULE.ALL_CATEGORY)]["false_alarm_events"]), 0
+        )
+        self.assertNotIn(("hey eva", MODULE.ALL_CATEGORY), indexed)
+
+    def test_resume_device_keywords_rejects_unrecoverable_device_rows(self):
+        with self.assertRaisesRegex(MODULE.EvaluationError, "cannot reconstruct"):
+            MODULE._resume_device_keywords(
+                {},
+                [{"keyword": MODULE.DEVICE_KEYWORD}],
+            )
+
+
 class TestSweep(unittest.TestCase):
     def test_sweep_invokes_decoder_once_and_resume_checks_fingerprint(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1031,6 +1251,8 @@ with output.open("w", encoding="utf-8", newline="") as handle:
             self.assertEqual(decoder_argv[cache_index + 1], str(feature_cache))
             batch_index = decoder_argv.index("--stream-batch-size")
             self.assertEqual(decoder_argv[batch_index + 1], "8")
+            keyword_index = decoder_argv.index("--keywords")
+            self.assertEqual(decoder_argv[keyword_index + 1], "WAKE")
             event_rows = read_csv(output_dir / "inference" / "manifest.csv")
             self.assertEqual(
                 {row["keywords_threshold"] for row in event_rows}, {"0.2", "0.4"}
@@ -1076,6 +1298,19 @@ with output.open("w", encoding="utf-8", newline="") as handle:
             return_code, _, stderr = quiet_main(resume_args)
             self.assertEqual(return_code, 0, stderr)
             self.assertEqual(counter.read_text(encoding="utf-8"), "1")
+
+            run_path = output_dir / "run.json"
+            run_payload = json.loads(run_path.read_text(encoding="utf-8"))
+            self.assertEqual(run_payload["device_keywords"], ["WAKE"])
+            del run_payload["device_keywords"]
+            run_path.write_text(
+                json.dumps(run_payload, ensure_ascii=False), encoding="utf-8"
+            )
+            return_code, _, stderr = quiet_main(resume_args)
+            self.assertEqual(return_code, 0, stderr)
+            self.assertEqual(counter.read_text(encoding="utf-8"), "1")
+            restored = json.loads(run_path.read_text(encoding="utf-8"))
+            self.assertEqual(restored["device_keywords"], ["WAKE"])
 
             event_manifest = output_dir / "inference" / "manifest.csv"
             original_events = event_manifest.read_text(encoding="utf-8")

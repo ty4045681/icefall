@@ -25,8 +25,9 @@ The inference and reporting layers are deliberately separate:
 * ``report`` rebuilds metrics and charts from an existing run without model
   inference.
 
-One input manifest row is one audio-keyword trial.  A trial can contribute
-multiple false-alarm events, but is counted as triggered at most once.
+One input manifest row is one audio clip.  All device keywords share one
+ContextGraph.  A trial can contribute multiple false-alarm events, but is
+counted as triggered at most once.
 """
 
 from __future__ import annotations
@@ -57,6 +58,7 @@ from typing import (
     Iterable,
     List,
     Mapping,
+    NamedTuple,
     Optional,
     Sequence,
     Tuple,
@@ -87,6 +89,12 @@ DEFAULT_DECODE_SCRIPT = SCRIPT_DIR / "streaming_kws.py"
 RUN_SCHEMA_VERSION = 1
 UNCATEGORIZED = "uncategorized"
 ALL_CATEGORY = "ALL"
+DEVICE_KEYWORD = "DEVICE"
+
+
+class Hit(NamedTuple):
+    score: float
+    detected_keyword: str
 
 EXPOSURE_FIELDS = (
     "source_manifest_row",
@@ -139,6 +147,209 @@ OWNED_DECODER_ARGS = {
 
 class EvaluationError(RuntimeError):
     """A concise, user-facing evaluation error."""
+
+
+def _is_reserved_keyword(keyword: str) -> bool:
+    return keyword == DEVICE_KEYWORD or keyword.upper() == DEVICE_KEYWORD
+
+
+def _canonicalize_keywords(values: Iterable[str]) -> List[str]:
+    keywords = []
+    seen = set()
+    for raw_keyword in values:
+        keyword = str(raw_keyword).strip()
+        if not keyword:
+            raise EvaluationError("keyword must not be empty")
+        if _is_reserved_keyword(keyword):
+            raise EvaluationError(
+                "keyword {!r} is reserved for device-level aggregates".format(
+                    keyword
+                )
+            )
+        if keyword not in seen:
+            keywords.append(keyword)
+            seen.add(keyword)
+    if not keywords:
+        raise EvaluationError("at least one keyword is required")
+    return keywords
+
+
+def _trial_keyword(keywords: Sequence[str]) -> str:
+    if len(keywords) == 1:
+        return keywords[0]
+    return DEVICE_KEYWORD
+
+
+def _format_keywords_json(keywords: Sequence[str]) -> str:
+    return json.dumps(list(keywords), ensure_ascii=False, separators=(",", ":"))
+
+
+def _parse_keywords_json(raw: str, *, source: str) -> List[str]:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise EvaluationError(
+            "{} has invalid keywords JSON: {}".format(source, error)
+        ) from error
+    if not isinstance(value, list) or not value:
+        raise EvaluationError("{} keywords must be a non-empty JSON array".format(source))
+    if any(isinstance(item, bool) or not isinstance(item, str) for item in value):
+        raise EvaluationError("{} keywords must be a JSON array of strings".format(source))
+    return _canonicalize_keywords(value)
+
+
+def _device_keywords_for_report(
+    run: Mapping[str, Any],
+    exposure: Sequence[Mapping[str, Any]],
+    hits: Mapping[Tuple[str, int], Sequence[Hit]],
+) -> List[str]:
+    stored = run.get("device_keywords")
+    if isinstance(stored, list) and stored:
+        if any(
+            isinstance(item, bool) or not isinstance(item, str) or not item.strip()
+            for item in stored
+        ):
+            raise EvaluationError("run.json device_keywords must be a list of strings")
+        return _canonicalize_keywords(stored)
+    unique: List[str] = []
+    seen = set()
+    for row in exposure:
+        keyword = str(row["keyword"])
+        if keyword not in seen:
+            unique.append(keyword)
+            seen.add(keyword)
+    if unique != [DEVICE_KEYWORD]:
+        return unique
+    phrases: List[str] = []
+    seen_phrases = set()
+    for trial_hits in hits.values():
+        for hit in trial_hits:
+            phrase = hit.detected_keyword
+            if phrase and phrase not in seen_phrases and phrase != DEVICE_KEYWORD:
+                phrases.append(phrase)
+                seen_phrases.add(phrase)
+    return unique + sorted(phrases)
+
+
+def _inferred_text_phrase(spec: str) -> str:
+    source = str(spec).strip()
+    tagged = re.match(r"^(text|bpe_ids|bpe_pieces)\s*:(.*)$", source, re.I | re.S)
+    if tagged is not None:
+        kind = tagged.group(1).lower()
+        payload = tagged.group(2).strip()
+        if kind == "text":
+            return payload.upper()
+        return source
+    if source.startswith("[") or re.match(r"^bpe[^:]*:", source, re.I):
+        return source
+    return source.upper()
+
+
+def _phrase_for_spec(spec: str, keyword_phrases: Mapping[str, str]) -> str:
+    mapped = keyword_phrases.get(spec)
+    if mapped:
+        return mapped
+    return _inferred_text_phrase(spec)
+
+
+def _report_phrases(
+    device_keywords: Sequence[str], keyword_phrases: Mapping[str, str]
+) -> List[str]:
+    phrases: List[str] = []
+    seen = set()
+    for spec in device_keywords:
+        if str(spec) == DEVICE_KEYWORD:
+            continue
+        phrase = _phrase_for_spec(str(spec), keyword_phrases)
+        if phrase != DEVICE_KEYWORD and phrase not in seen:
+            phrases.append(phrase)
+            seen.add(phrase)
+    return phrases
+
+
+def _parse_keyword_phrases(raw: Any) -> Dict[str, str]:
+    pairs: List[Tuple[str, str]] = []
+    if isinstance(raw, Mapping):
+        pairs = [(str(spec), str(phrase)) for spec, phrase in raw.items()]
+    elif isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, Mapping):
+                continue
+            spec = str(entry.get("spec", "")).strip()
+            phrase = str(entry.get("phrase", "")).strip()
+            if spec and phrase:
+                pairs.append((spec, phrase))
+    mapping: Dict[str, str] = {}
+    for spec, phrase in pairs:
+        spec_text = spec.strip()
+        phrase_text = phrase.strip()
+        if spec_text and phrase_text and spec_text not in mapping:
+            mapping[spec_text] = phrase_text
+    return mapping
+
+
+def _keyword_phrases_from_run(run: Mapping[str, Any], run_dir: Path) -> Dict[str, str]:
+    mapping = _parse_keyword_phrases(run.get("keyword_phrases"))
+    if mapping:
+        return mapping
+    inference_summary = run_dir / "inference" / "summary.json"
+    if not inference_summary.is_file():
+        return {}
+    try:
+        payload = json.loads(inference_summary.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, dict):
+        return {}
+    return _parse_keyword_phrases(provenance.get("keyword_phrases"))
+
+
+def _resume_device_keywords(
+    run: Mapping[str, Any],
+    exposure: Sequence[Mapping[str, Any]],
+) -> List[str]:
+    stored = run.get("device_keywords")
+    if isinstance(stored, list) and stored:
+        if any(
+            isinstance(item, bool) or not isinstance(item, str) or not item.strip()
+            for item in stored
+        ):
+            raise EvaluationError("run.json device_keywords must be a list of strings")
+        return _canonicalize_keywords(stored)
+    unique: List[str] = []
+    seen = set()
+    for row in exposure:
+        keyword = str(row["keyword"]).strip()
+        if keyword and keyword not in seen:
+            unique.append(keyword)
+            seen.add(keyword)
+    if unique == [DEVICE_KEYWORD]:
+        raise EvaluationError(
+            "--resume run.json has no device_keywords and cannot reconstruct "
+            "the shared keyword list from DEVICE trial rows"
+        )
+    return unique
+
+
+def _keywords_from_row(row: Mapping[str, Any], *, source: str) -> List[str]:
+    raw_json = str(row.get("keywords", "") or "").strip()
+    keyword = str(row.get("keyword", "") or "").strip()
+    if raw_json:
+        keywords = _parse_keywords_json(raw_json, source=source)
+        expected = _trial_keyword(keywords)
+        if keyword and keyword != expected:
+            raise EvaluationError(
+                "{} keyword {!r} does not match keywords {}".format(
+                    source, keyword, keywords
+                )
+            )
+        return keywords
+    if not keyword:
+        raise EvaluationError("{} has empty keyword".format(source))
+    return _canonicalize_keywords([keyword])
 
 
 def _utc_now() -> str:
@@ -377,15 +588,9 @@ def prepare_manifest(args: argparse.Namespace) -> int:
             )
         )
 
-    keywords = []
-    seen_keywords = set()
-    for raw_keyword in args.keyword:
-        keyword = raw_keyword.strip()
-        if not keyword:
-            raise EvaluationError("--keyword must not be empty")
-        if keyword not in seen_keywords:
-            keywords.append(keyword)
-            seen_keywords.add(keyword)
+    keywords = _canonicalize_keywords(args.keyword)
+    trial_keyword = _trial_keyword(keywords)
+    keywords_cell = _format_keywords_json(keywords)
 
     rows: List[Dict[str, Any]] = []
     for audio_path in audio_paths:
@@ -416,21 +621,22 @@ def prepare_manifest(args: argparse.Namespace) -> int:
             manifest_audio_path = Path(
                 os.path.relpath(str(audio_path), str(output_manifest.parent))
             ).as_posix()
-        for keyword in keywords:
-            rows.append(
-                {
-                    "audio_path": manifest_audio_path,
-                    "keyword": keyword,
-                    "label": "0",
-                    "category": category,
-                    "source_duration_sec": _format_number(duration, 12),
-                }
-            )
+        rows.append(
+            {
+                "audio_path": manifest_audio_path,
+                "keyword": trial_keyword,
+                "keywords": keywords_cell,
+                "label": "0",
+                "category": category,
+                "source_duration_sec": _format_number(duration, 12),
+            }
+        )
     _atomic_write_csv(
         output_manifest,
         (
             "audio_path",
             "keyword",
+            "keywords",
             "label",
             "category",
             "source_duration_sec",
@@ -439,8 +645,12 @@ def prepare_manifest(args: argparse.Namespace) -> int:
         overwrite=args.overwrite,
     )
     print(
-        "Prepared {} negative trials from {} audio files: {}".format(
-            len(rows), len(audio_paths), output_manifest
+        "Prepared {} negative trials from {} audio files ({} keyword{}): {}".format(
+            len(rows),
+            len(audio_paths),
+            len(keywords),
+            "" if len(keywords) == 1 else "s",
+            output_manifest,
         )
     )
     return 0
@@ -542,7 +752,7 @@ def _build_exposure(
     category_field: str,
     duration_field: str,
     assume_negative: bool,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], List[str]]:
     fieldnames, rows = _read_csv(manifest_path)
     missing = {"audio_path", "keyword"}.difference(fieldnames)
     if missing:
@@ -563,10 +773,34 @@ def _build_exposure(
         )
 
     exposure = []
+    device_keywords: Optional[List[str]] = None
+    seen_audio: Dict[str, int] = {}
     for offset, row in enumerate(rows, start=2):
-        keyword = row.get("keyword", "").strip()
-        if not keyword:
-            raise EvaluationError("manifest row {} has empty keyword".format(offset))
+        audio_path = _resolve_audio_path(
+            row.get("audio_path", ""), manifest_path, offset
+        )
+        resolved = str(audio_path)
+        previous = seen_audio.get(resolved)
+        if previous is not None:
+            raise EvaluationError(
+                "duplicate audio {} (manifest rows {} and {}); device-level "
+                "evaluation uses one trial per clip".format(
+                    resolved, previous, offset
+                )
+            )
+        seen_audio[resolved] = offset
+        keywords = _keywords_from_row(
+            row, source="manifest row {}".format(offset)
+        )
+        if device_keywords is None:
+            device_keywords = keywords
+        elif keywords != device_keywords:
+            raise EvaluationError(
+                "manifest row {} keyword list {} differs from {} used by earlier rows".format(
+                    offset, keywords, device_keywords
+                )
+            )
+        keyword = str(row.get("keyword", "") or "").strip() or _trial_keyword(keywords)
         raw_label = row.get("label", "").strip()
         if raw_label:
             try:
@@ -586,9 +820,6 @@ def _build_exposure(
                 "manifest row {} has no label; expected label=0".format(offset)
             )
 
-        audio_path = _resolve_audio_path(
-            row.get("audio_path", ""), manifest_path, offset
-        )
         category = (
             row.get(category_field, "").strip() if category_field else ""
         ) or UNCATEGORIZED
@@ -620,16 +851,16 @@ def _build_exposure(
             {
                 "source_manifest_row": offset,
                 "audio_path": row["audio_path"],
-                "audio_path_resolved": str(audio_path),
+                "audio_path_resolved": resolved,
                 "keyword": keyword,
                 "label": "0",
                 "category": category,
                 "duration_sec": _format_number(duration, 12),
             }
         )
-    if not exposure:
+    if not exposure or device_keywords is None:
         raise EvaluationError("manifest contains no trials: {}".format(manifest_path))
-    return exposure
+    return exposure, device_keywords
 
 
 def _validate_decoder_args(values: Sequence[str]) -> List[str]:
@@ -944,6 +1175,7 @@ def _validate_resume(
     decoder_input_fingerprint: Mapping[str, Any],
     thresholds: Sequence[str],
     decoder_args: Sequence[str],
+    device_keywords: Sequence[str],
     category_field: str,
     duration_field: str,
     assume_negative: bool,
@@ -1010,6 +1242,15 @@ def _validate_resume(
         raise EvaluationError(
             "--resume event manifest content differs from the completed run"
         )
+    exposure = _load_exposure(exposure_path)
+    try:
+        resumed_keywords = _resume_device_keywords(run, exposure)
+    except EvaluationError as error:
+        raise EvaluationError(
+            "--resume configuration differs in: device_keywords ({})".format(error)
+        ) from error
+    if resumed_keywords != list(device_keywords):
+        raise EvaluationError("--resume configuration differs in: device_keywords")
     _exact_results_path_from_run(run_dir, run)
     return event_manifest
 
@@ -1037,7 +1278,7 @@ def run_sweep(args: argparse.Namespace) -> int:
     decoder_args = _validate_decoder_args(args.decoder_args)
     manifest_sha256 = _sha256(manifest_path)
     decode_script_sha256 = _sha256(decode_script)
-    exposure = _build_exposure(
+    exposure, device_keywords = _build_exposure(
         manifest_path,
         category_field=args.category_field,
         duration_field=args.duration_field,
@@ -1105,6 +1346,7 @@ def run_sweep(args: argparse.Namespace) -> int:
             decoder_input_fingerprint=decoder_input_fingerprint,
             thresholds=thresholds,
             decoder_args=decoder_args,
+            device_keywords=device_keywords,
             category_field=args.category_field,
             duration_field=args.duration_field,
             assume_negative=args.assume_negative,
@@ -1115,6 +1357,7 @@ def run_sweep(args: argparse.Namespace) -> int:
                 "status": "complete",
                 "resumed_at": _utc_now(),
                 "finished_at": _utc_now(),
+                "device_keywords": list(device_keywords),
                 "artifacts": artifacts,
             }
         )
@@ -1155,6 +1398,8 @@ def run_sweep(args: argparse.Namespace) -> int:
     ]
     if args.overwrite:
         command.append("--overwrite")
+    for keyword in device_keywords:
+        command.extend(["--keywords", keyword])
     command.extend(decoder_args)
     run_record: Dict[str, Any] = {
         "schema_version": RUN_SCHEMA_VERSION,
@@ -1167,6 +1412,7 @@ def run_sweep(args: argparse.Namespace) -> int:
         "audio_fingerprint": audio_fingerprint,
         "decoder_input_fingerprint": decoder_input_fingerprint,
         "decoder_args": decoder_args,
+        "device_keywords": list(device_keywords),
         "thresholds": thresholds,
         "category_field": args.category_field,
         "duration_field": args.duration_field,
@@ -1335,6 +1581,7 @@ def run_sweep(args: argparse.Namespace) -> int:
             "decoder_return_code": 0,
             "event_manifest_sha256": _sha256(event_manifest),
             "inference_finished_at": _utc_now(),
+            "keyword_phrases": _keyword_phrases_from_run(run_record, output_dir),
         }
     )
     _atomic_write_json(run_path, run_record, overwrite=True)
@@ -1493,7 +1740,7 @@ def _load_hits(
     *,
     thresholds: Sequence[str],
     exposure_by_row: Mapping[int, Mapping[str, Any]],
-) -> Dict[Tuple[str, int], List[float]]:
+) -> Dict[Tuple[str, int], List[Hit]]:
     fields, rows = _read_csv(path)
     required = {"source_manifest_row", "keywords_threshold", "score"}
     missing = required.difference(fields)
@@ -1502,7 +1749,7 @@ def _load_hits(
             "event manifest is missing column(s): {}".format(", ".join(sorted(missing)))
         )
     requested = set(thresholds)
-    hits: DefaultDict[Tuple[str, int], List[float]] = defaultdict(list)
+    hits: DefaultDict[Tuple[str, int], List[Hit]] = defaultdict(list)
     for csv_row, row in enumerate(rows, start=2):
         try:
             source_row = int(row["source_manifest_row"])
@@ -1542,7 +1789,14 @@ def _load_hits(
                     csv_row
                 )
             )
-        hits[(threshold, source_row)].append(score)
+        detected_keyword = row.get("detected_keyword", "").strip()
+        if not detected_keyword:
+            trial_keyword = str(exposure_by_row[source_row]["keyword"])
+            if trial_keyword != DEVICE_KEYWORD:
+                detected_keyword = trial_keyword
+        hits[(threshold, source_row)].append(
+            Hit(score=score, detected_keyword=detected_keyword)
+        )
     return dict(hits)
 
 
@@ -1569,7 +1823,7 @@ def _load_exact_results(
     allow_missing_label: bool = False,
 ) -> Tuple[
     List[Dict[str, Any]],
-    Dict[Tuple[str, int], List[float]],
+    Dict[Tuple[str, int], List[Hit]],
     str,
 ]:
     """Validate and canonicalize streaming_kws exact-threshold observations."""
@@ -1583,7 +1837,7 @@ def _load_exact_results(
     }
     seen = set()
     records: List[Dict[str, Any]] = []
-    hits: Dict[Tuple[str, int], List[float]] = {}
+    hits: Dict[Tuple[str, int], List[Hit]] = {}
     legacy_score_present: Optional[bool] = None
     for line_number, line in _strict_utf8_lines(path):
         try:
@@ -1778,6 +2032,8 @@ def _load_exact_results(
                     )
                 )
             scores = []
+            trial_hits: List[Hit] = []
+            trial_keyword = str(exposure["keyword"])
             for event_index, event in enumerate(detections):
                 raw_score = event.get("score")
                 if isinstance(raw_score, bool) or not isinstance(
@@ -1796,6 +2052,12 @@ def _load_exact_results(
                         )
                     )
                 scores.append(score)
+                detected_keyword = str(event.get("detected_keyword", "")).strip()
+                if not detected_keyword and trial_keyword != DEVICE_KEYWORD:
+                    detected_keyword = trial_keyword
+                trial_hits.append(
+                    Hit(score=score, detected_keyword=detected_keyword)
+                )
             # Schema v1 included a DMA-KWS aggregate score. Accept and validate
             # it when reading old runs, but canonical schema-v2 records retain
             # only the native Icefall scores in detections[*].score.
@@ -1842,7 +2104,7 @@ def _load_exact_results(
                     manifest_meta=manifest_meta,
                 )
             )
-            hits[identity] = scores
+            hits[identity] = trial_hits
         except ArtifactError as error:
             raise EvaluationError(
                 "invalid exact result at line {}: {}".format(line_number, error)
@@ -1872,13 +2134,14 @@ def _load_exact_results(
 def _source_metrics(
     thresholds: Sequence[str],
     exposure: Sequence[Mapping[str, Any]],
-    hits: Mapping[Tuple[str, int], Sequence[float]],
+    hits: Mapping[Tuple[str, int], Sequence[Hit]],
 ) -> List[Dict[str, Any]]:
     rows = []
     for threshold in thresholds:
         for item in exposure:
             source_row = int(item["source_manifest_row"])
-            scores = list(hits.get((threshold, source_row), ()))
+            trial_hits = list(hits.get((threshold, source_row), ()))
+            scores = [hit.score for hit in trial_hits]
             rows.append(
                 {
                     "threshold": threshold,
@@ -1888,8 +2151,8 @@ def _source_metrics(
                     "keyword": item["keyword"],
                     "category": item["category"],
                     "duration_sec": _format_number(float(item["duration_sec"]), 12),
-                    "false_alarm_events": len(scores),
-                    "triggered": int(bool(scores)),
+                    "false_alarm_events": len(trial_hits),
+                    "triggered": int(bool(trial_hits)),
                     "max_score": "" if not scores else _format_number(max(scores), 12),
                 }
             )
@@ -1898,14 +2161,14 @@ def _source_metrics(
 
 def _standard_evaluation_records(
     source_rows: Sequence[Mapping[str, Any]],
-    hits: Mapping[Tuple[str, int], Sequence[float]],
+    hits: Mapping[Tuple[str, int], Sequence[Hit]],
 ) -> List[Dict[str, Any]]:
     """Adapt exact threshold/trial observations to the shared JSONL schema."""
     records = []
     for row in source_rows:
         threshold = str(row["threshold"])
         source_row = int(row["source_manifest_row"])
-        scores = list(hits.get((threshold, source_row), ()))
+        trial_hits = list(hits.get((threshold, source_row), ()))
         records.append(
             build_evaluation_result(
                 source_manifest_row=source_row,
@@ -1916,11 +2179,12 @@ def _standard_evaluation_records(
                 threshold=threshold,
                 events=[
                     {
-                        "score": float(score),
+                        "score": float(hit.score),
+                        "detected_keyword": hit.detected_keyword,
                         "event_index": index,
                         "clip_exported": True,
                     }
-                    for index, score in enumerate(scores)
+                    for index, hit in enumerate(trial_hits)
                 ],
                 duration_sec=float(row["duration_sec"]),
                 manifest_meta={"category": str(row["category"])},
@@ -1929,12 +2193,52 @@ def _standard_evaluation_records(
     return records
 
 
+def _threshold_metric_row(
+    *,
+    threshold: str,
+    keyword: str,
+    category: str,
+    group: Sequence[Mapping[str, Any]],
+    event_count: int,
+    triggered: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    exposure_sec = sum(float(row["duration_sec"]) for row in group)
+    exposure_hours = exposure_sec / 3600.0
+    unique_files = {str(row["audio_path_resolved"]) for row in group}
+    triggered_files = {str(row["audio_path_resolved"]) for row in triggered}
+    trial_count = len(group)
+    return {
+        "threshold": threshold,
+        "keyword": keyword,
+        "category": category,
+        "source_trials": trial_count,
+        "unique_audio_files": len(unique_files),
+        "exposure_sec": _format_number(exposure_sec, 12),
+        "exposure_hours": _format_number(exposure_hours, 12),
+        "false_alarm_events": event_count,
+        "triggered_source_trials": len(triggered),
+        "triggered_audio_files": len(triggered_files),
+        "fa_per_hour": _format_number(
+            event_count / exposure_hours if exposure_hours else 0.0, 12
+        ),
+        "source_trial_trigger_rate": _format_number(
+            len(triggered) / trial_count if trial_count else 0.0, 12
+        ),
+    }
+
+
 def _threshold_metrics(
-    thresholds: Sequence[str], source_rows: Sequence[Mapping[str, Any]]
+    thresholds: Sequence[str],
+    source_rows: Sequence[Mapping[str, Any]],
+    hits: Optional[Mapping[Tuple[str, int], Sequence[Hit]]] = None,
+    device_keywords: Optional[Sequence[str]] = None,
+    keyword_phrases: Optional[Mapping[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     by_threshold: DefaultDict[str, List[Mapping[str, Any]]] = defaultdict(list)
     for row in source_rows:
         by_threshold[str(row["threshold"])].append(row)
+    hit_map = hits or {}
+    phrase_keywords = _report_phrases(device_keywords or (), keyword_phrases or {})
 
     result = []
     for threshold in thresholds:
@@ -1949,33 +2253,71 @@ def _threshold_metrics(
                     if category == ALL_CATEGORY
                     else [row for row in keyword_rows if row["category"] == category]
                 )
-                exposure_sec = sum(float(row["duration_sec"]) for row in group)
-                exposure_hours = exposure_sec / 3600.0
-                event_count = sum(int(row["false_alarm_events"]) for row in group)
                 triggered = [row for row in group if int(row["triggered"])]
-                unique_files = {str(row["audio_path_resolved"]) for row in group}
-                triggered_files = {str(row["audio_path_resolved"]) for row in triggered}
-                trial_count = len(group)
                 result.append(
-                    {
-                        "threshold": threshold,
-                        "keyword": keyword,
-                        "category": category,
-                        "source_trials": trial_count,
-                        "unique_audio_files": len(unique_files),
-                        "exposure_sec": _format_number(exposure_sec, 12),
-                        "exposure_hours": _format_number(exposure_hours, 12),
-                        "false_alarm_events": event_count,
-                        "triggered_source_trials": len(triggered),
-                        "triggered_audio_files": len(triggered_files),
-                        "fa_per_hour": _format_number(
-                            event_count / exposure_hours if exposure_hours else 0.0, 12
+                    _threshold_metric_row(
+                        threshold=threshold,
+                        keyword=keyword,
+                        category=category,
+                        group=group,
+                        event_count=sum(
+                            int(row["false_alarm_events"]) for row in group
                         ),
-                        "source_trial_trigger_rate": _format_number(
-                            len(triggered) / trial_count if trial_count else 0.0, 12
-                        ),
-                    }
+                        triggered=triggered,
+                    )
                 )
+        if len(phrase_keywords) > 1 and DEVICE_KEYWORD in {
+            str(row["keyword"]) for row in threshold_rows
+        }:
+            extra_phrases = []
+            seen_phrases = set(phrase_keywords)
+            for row in threshold_rows:
+                source_row = int(row["source_manifest_row"])
+                for hit in hit_map.get((threshold, source_row), ()):
+                    phrase = hit.detected_keyword
+                    if (
+                        phrase
+                        and phrase != DEVICE_KEYWORD
+                        and phrase not in seen_phrases
+                    ):
+                        extra_phrases.append(phrase)
+                        seen_phrases.add(phrase)
+            categories = sorted({str(row["category"]) for row in threshold_rows})
+            for phrase in phrase_keywords + extra_phrases:
+                for category in categories + [ALL_CATEGORY]:
+                    group = (
+                        threshold_rows
+                        if category == ALL_CATEGORY
+                        else [
+                            row
+                            for row in threshold_rows
+                            if row["category"] == category
+                        ]
+                    )
+                    triggered = []
+                    event_count = 0
+                    for row in group:
+                        phrase_hits = [
+                            hit
+                            for hit in hit_map.get(
+                                (threshold, int(row["source_manifest_row"])),
+                                (),
+                            )
+                            if hit.detected_keyword == phrase
+                        ]
+                        event_count += len(phrase_hits)
+                        if phrase_hits:
+                            triggered.append(row)
+                    result.append(
+                        _threshold_metric_row(
+                            threshold=threshold,
+                            keyword=phrase,
+                            category=category,
+                            group=group,
+                            event_count=event_count,
+                            triggered=triggered,
+                        )
+                    )
     return result
 
 
@@ -2219,7 +2561,7 @@ body{{font-family:ui-sans-serif,system-ui,sans-serif;margin:0;color:#111827;back
 </head>
 <body><main>
 <h1>KWS negative-set evaluation</h1>
-<p><small>Generated {generated}. One manifest row is one audio-keyword trial. FA/h = false-alarm events / summed trial exposure hours.</small></p>
+<p><small>Generated {generated}. One manifest row is one audio clip. All device keywords share one ContextGraph; any keyword firing is one FA. FA/h = false-alarm events / unique-audio exposure hours.</small></p>
 <section><h2>Run</h2><p>Manifest: <code>{manifest}</code></p><p>Thresholds: <code>{thresholds}</code></p></section>
 {warnings}
 {charts}
@@ -2303,9 +2645,26 @@ def build_report(run_dir: Path, overwrite: bool) -> Dict[str, Any]:
     source_rows = _source_metrics(thresholds, exposure, hits)
     if exact_results_path is None:
         standard_records = _standard_evaluation_records(source_rows, hits)
-    summary_rows = _threshold_metrics(thresholds, source_rows)
+    device_keywords = _device_keywords_for_report(run, exposure, hits)
+    keyword_phrases = _keyword_phrases_from_run(run, run_dir)
+    summary_rows = _threshold_metrics(
+        thresholds,
+        source_rows,
+        hits=hits,
+        device_keywords=device_keywords,
+        keyword_phrases=keyword_phrases,
+    )
     warnings = _nonmonotonic_warnings(summary_rows, "fa_per_hour")
     warnings.extend(_nonmonotonic_warnings(summary_rows, "source_trial_trigger_rate"))
+    if any(
+        not hit.detected_keyword
+        for trial_hits in hits.values()
+        for hit in trial_hits
+    ) and len(device_keywords) > 1:
+        warnings.append(
+            "one or more events have empty detected_keyword; they count only "
+            "in the DEVICE aggregate"
+        )
 
     report_dir = run_dir / "report"
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -2373,12 +2732,14 @@ def build_report(run_dir: Path, overwrite: bool) -> Dict[str, Any]:
         "schema_version": RUN_SCHEMA_VERSION,
         "generated_at": _utc_now(),
         "semantics": {
-            "trial": "one input manifest row (one audio-keyword pair)",
+            "trial": "one input manifest row (one audio clip)",
             "false_alarm_events": "all detected events; multiple events per trial count",
             "triggered_source_trials": "trials with one or more events; each trial counts once",
-            "fa_per_hour": "false_alarm_events / summed source-trial exposure hours",
+            "fa_per_hour": "false_alarm_events / unique-audio exposure hours",
+            "device_keywords": "all keywords share one ContextGraph; DEVICE is the aggregate",
             "observation_source": observation_semantics,
         },
+        "device_keywords": list(device_keywords),
         "thresholds": thresholds,
         "source_trials": len(exposure),
         "event_count": sum(len(scores) for scores in hits.values()),
@@ -2461,7 +2822,7 @@ def get_parser() -> argparse.ArgumentParser:
     prepare = subparsers.add_parser(
         "prepare",
         allow_abbrev=False,
-        help="Recursively create a label=0 manifest (one row per audio-keyword pair).",
+        help="Recursively create a label=0 manifest (one row per audio clip).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     prepare.add_argument("--input-dir", type=Path, required=True)
@@ -2470,7 +2831,7 @@ def get_parser() -> argparse.ArgumentParser:
         "--keyword",
         action="append",
         required=True,
-        help="Keyword text or direct BPE form; repeat to create multiple trials per audio.",
+        help="Device keyword text or direct BPE form; repeat to fill one shared ContextGraph.",
     )
     prepare.add_argument(
         "--extensions",
